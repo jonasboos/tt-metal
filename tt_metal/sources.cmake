@@ -203,6 +203,7 @@ set(TT_METAL_PUBLIC_API
 )
 
 set(TT_METAL_SOURCES
+    api/internal/kernel_build_options.hpp
     impl/host_api/tt_metal.cpp
     impl/experimental/offline_compile/offline_kernel_compile.cpp
     impl/graph/graph_tracking.cpp
