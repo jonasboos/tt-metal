@@ -1789,9 +1789,9 @@ Hardmish:  # measured by: exhaustive Float16_b/Float16/Bfp8_b/Bfp4_b + strided F
   - {in: Float32, out: Bfp8_b, dest: "Yes", metric: tolerance}  # not measurable: 3 lane(s) disagreeing with the golden about being finite (golden -> result: x=3.37532e+38: 3.37624e+38 -> inf; x=3.38354e+38: 3.38953e+38 -> inf); max 393 ULP over the 65021 measurable lanes
   - {in: Float32, out: Float16, dest: "No", max_ulp: 2}  # max 1 ULP
   - {in: Float32, out: Float16, dest: "Yes", max_ulp: 2}  # max 1 ULP
-  - {in: Float32, out: Float16_b, dest: "No", max_ulp: 2}  # max 1 ULP
+  - {in: Float32, out: Float16_b, dest: "No", max_ulp: 1}  # max 0 ULP
   - {in: Float32, out: Float16_b, dest: "Yes", max_ulp: 2}  # max 1 ULP
-  - {in: Float32, out: Float32, dest: "No", max_ulp: 72090}  # max 65536 ULP
+  - {in: Float32, out: Float32, dest: "No", max_ulp: 1}  # max 0 ULP
   - {in: Float32, out: Float32, dest: "Yes", max_ulp: 2}  # max 1 ULP
 
 
