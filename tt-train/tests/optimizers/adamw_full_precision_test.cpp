@@ -7,12 +7,20 @@
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <optional>
+#include <string>
+#include <utility>
 
 #include "autograd/auto_context.hpp"
 #include "autograd/autocast_tensor.hpp"
 #include "core/tt_tensor_utils.hpp"
+#include "metal/operations.hpp"
 #include "test_utils/random_data.hpp"
 #include "tt-metalium/bfloat16.hpp"
 #include "ttnn/operations/core/core.hpp"
@@ -149,6 +157,15 @@ public:
 
     const xt::xarray<float>& get_master_weights() const {
         return m_master_weights;
+    }
+    const xt::xarray<float>& first_moment() const {
+        return m_first_moment;
+    }
+    const xt::xarray<float>& second_moment() const {
+        return m_second_moment;
+    }
+    const xt::xarray<float>& max_second_moment() const {
+        return m_max_second_moment;
     }
 
 private:
@@ -479,4 +496,348 @@ TEST_F(AdamWFullPrecisionStateDictTest, RestoredBetasDriveBiasCorrection) {
 
 TEST_F(AdamWFullPrecisionStateDictTest, BetaSettersRecomputeBiasCorrection) {
     run_effective_betas_step_and_compare(/*use_beta_setters=*/true);
+}
+
+// ====================================================================
+// Program-cache hits
+// lr, the betas, the beta powers, epsilon and weight decay are not part of the program hash, so a hit must re-apply
+// them with the new buffer addresses; at fp32 precision each of them moves the update far past the tolerance. Each
+// test starts from an empty program cache and keeps the tensors of its earlier launches alive.
+// ====================================================================
+
+class AdamWFullPrecisionCacheHitTest : public ::testing::Test {
+public:
+    static void SetUpTestSuite() {
+        ttml::autograd::ctx().open_device();
+    }
+    static void TearDownTestSuite() {
+        ttml::autograd::ctx().close_device();
+    }
+
+protected:
+    void SetUp() override {
+        // The suite shares one device and its program cache.
+        auto& device = ttml::autograd::ctx().get_device();
+        device.enable_program_cache();
+        device.clear_program_cache();
+    }
+    void TearDown() override {
+        ttml::autograd::ctx().reset_graph();
+    }
+};
+
+namespace {
+
+// The arguments of ttml::metal::adamw that are left out of the program hash. The beta powers are the ones
+// CPUAdamWFullPrecision uses for the step after `steps` completed ones.
+struct FullPrecisionStepScalars {
+    float lr;
+    float beta1;
+    float beta2;
+    size_t steps;
+    float epsilon;
+    float weight_decay;
+
+    bool operator==(const FullPrecisionStepScalars&) const = default;
+
+    [[nodiscard]] float beta1_pow() const {
+        return std::pow(beta1, static_cast<float>(steps + 1U));
+    }
+    [[nodiscard]] float beta2_pow() const {
+        return std::pow(beta2, static_cast<float>(steps + 1U));
+    }
+};
+
+// Without weight decay the kernel skips the decay multiply; launch B changes every scalar of launch A.
+constexpr FullPrecisionStepScalars kScalarsA{1e-3F, 0.9F, 0.999F, 10U, 1e-8F, 0.0F};
+constexpr FullPrecisionStepScalars kScalarsB{1e-2F, 0.5F, 0.9F, 3U, 1e-3F, 0.1F};
+// AMSGrad keeps weight decay at 0, as kAMSGradCases does (#46121).
+constexpr FullPrecisionStepScalars kAmsgradScalarsB{1e-2F, 0.5F, 0.9F, 3U, 1e-3F, 0.0F};
+
+// The parameter's mean and max error tolerances; the moments take the max one.
+struct Tolerances {
+    float mean_error;
+    float max_error;
+};
+// run_steps_and_compare's tolerances, and the bf16 ones of AdamWComparisonTest.
+constexpr Tolerances kFp32Tolerances{1e-7f, 1e-6f};
+constexpr Tolerances kBf16Tolerances{1e-3f, 1e-2f};
+
+// The update splits the parameter's tiles over the cores. More tiles than cores, and not a multiple of the core
+// count, so that split_work_to_cores hands out two core groups (one compute kernel each) on any grid.
+std::array<size_t, 4> full_precision_two_core_group_shape() {
+    const auto grid = ttml::autograd::ctx().get_device().compute_with_storage_grid_size();
+    const size_t tiles = 2U * grid.x * grid.y + 3U;
+    return {1U, 1U, tiles * 32U, 32U};
+}
+
+// A device tensor and the values the kernels read from it.
+struct StoredTensor {
+    ttnn::Tensor tensor;
+    xt::xarray<float> before;
+};
+
+StoredTensor store(ttnn::Tensor tensor) {
+    auto before = ttml::core::to_xtensor(tensor);
+    return {std::move(tensor), std::move(before)};
+}
+
+// The tensors of one launch as AdamWFullPrecision passes them: fp32 parameter and states and a bf16 gradient. With
+// bf16 parameter and states the same call runs the op's bf16 program.
+struct AdamWLaunchTensors {
+    StoredTensor param;
+    StoredTensor grad;
+    StoredTensor exp_avg;
+    StoredTensor exp_avg_sq;
+    std::optional<StoredTensor> max_exp_avg_sq;  // AMSGrad only
+};
+
+AdamWLaunchTensors make_launch_tensors(
+    const std::array<size_t, 4>& shape,
+    bool amsgrad,
+    uint32_t seed,
+    ttnn::DataType state_dtype = ttnn::DataType::FLOAT32) {
+    using ttml::test_utils::make_uniform_xarray;
+    auto upload = [state_dtype](const xt::xarray<float>& values) {
+        return store(
+            state_dtype == ttnn::DataType::FLOAT32
+                ? to_tt_fp32(values)
+                : ttml::core::from_xtensor(values, &ttml::autograd::ctx().get_device()));
+    };
+    AdamWLaunchTensors tensors{
+        upload(make_uniform_xarray<float>(shape, -1.0F, 1.0F, seed)),
+        store(to_tt_bf16(make_uniform_xarray<bfloat16>(shape, bfloat16{-1.0F}, bfloat16{1.0F}, seed + 1U))),
+        upload(make_uniform_xarray<float>(shape, -1.0F, 1.0F, seed + 2U)),
+        upload(make_uniform_xarray<float>(shape, 0.0F, 1.0F, seed + 3U)),
+        std::nullopt};
+    if (amsgrad) {
+        tensors.max_exp_avg_sq = upload(make_uniform_xarray<float>(shape, 0.0F, 1.0F, seed + 4U));
+    }
+    return tensors;
+}
+
+ttnn::Tensor launch_adamw(const AdamWLaunchTensors& tensors, const FullPrecisionStepScalars& scalars) {
+    std::optional<ttnn::Tensor> max_exp_avg_sq;
+    if (tensors.max_exp_avg_sq.has_value()) {
+        max_exp_avg_sq = tensors.max_exp_avg_sq->tensor;
+    }
+    return ttml::metal::adamw(
+        tensors.param.tensor,
+        tensors.grad.tensor,
+        tensors.exp_avg.tensor,
+        tensors.exp_avg_sq.tensor,
+        max_exp_avg_sq,
+        scalars.lr,
+        scalars.beta1,
+        scalars.beta2,
+        scalars.beta1_pow(),
+        scalars.beta2_pow(),
+        scalars.epsilon,
+        scalars.weight_decay);
+}
+
+// Every tensor of a launch, as read back from the device or as CPUAdamWFullPrecision computes it.
+struct AdamWValues {
+    xt::xarray<float> param;
+    xt::xarray<float> grad;
+    xt::xarray<float> exp_avg;
+    xt::xarray<float> exp_avg_sq;
+    std::optional<xt::xarray<float>> max_exp_avg_sq;  // AMSGrad only
+};
+
+AdamWValues read_back(const AdamWLaunchTensors& tensors) {
+    AdamWValues values{
+        ttml::core::to_xtensor(tensors.param.tensor),
+        ttml::core::to_xtensor(tensors.grad.tensor),
+        ttml::core::to_xtensor(tensors.exp_avg.tensor),
+        ttml::core::to_xtensor(tensors.exp_avg_sq.tensor),
+        std::nullopt};
+    if (tensors.max_exp_avg_sq.has_value()) {
+        values.max_exp_avg_sq = ttml::core::to_xtensor(tensors.max_exp_avg_sq->tensor);
+    }
+    return values;
+}
+
+// CPUAdamWFullPrecision's step from the values the launch read.
+AdamWValues adamw_reference(const AdamWLaunchTensors& tensors, const FullPrecisionStepScalars& scalars) {
+    const bool amsgrad = tensors.max_exp_avg_sq.has_value();
+    CPUAdamWFullPrecision cpu_opt(
+        scalars.lr, scalars.beta1, scalars.beta2, scalars.epsilon, scalars.weight_decay, amsgrad);
+    if (amsgrad) {
+        cpu_opt.set_state(
+            tensors.param.before,
+            tensors.exp_avg.before,
+            tensors.exp_avg_sq.before,
+            scalars.steps,
+            tensors.max_exp_avg_sq->before);
+    } else {
+        cpu_opt.set_state(tensors.param.before, tensors.exp_avg.before, tensors.exp_avg_sq.before, scalars.steps);
+    }
+    xt::xarray<float> param = cpu_opt.step(tensors.grad.before);
+    AdamWValues values{
+        std::move(param), tensors.grad.before, cpu_opt.first_moment(), cpu_opt.second_moment(), std::nullopt};
+    if (amsgrad) {
+        values.max_exp_avg_sq = cpu_opt.max_second_moment();
+    }
+    return values;
+}
+
+std::pair<float, float> mean_and_max_error(const xt::xarray<float>& reference, const xt::xarray<float>& actual) {
+    float sum_error = 0.0f;
+    float max_error = 0.0f;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const float error = std::abs(reference.flat(i) - actual.flat(i));
+        sum_error += error;
+        max_error = std::max(max_error, error);
+    }
+    return {sum_error / static_cast<float>(reference.size()), max_error};
+}
+
+// Elements whose bits differ; all of them if the shapes differ.
+size_t count_bit_mismatches(const xt::xarray<float>& expected, const xt::xarray<float>& actual) {
+    if (expected.shape() != actual.shape()) {
+        return std::max(expected.size(), actual.size());
+    }
+    size_t mismatches = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        mismatches +=
+            static_cast<size_t>(std::bit_cast<uint32_t>(expected.flat(i)) != std::bit_cast<uint32_t>(actual.flat(i)));
+    }
+    return mismatches;
+}
+
+// The moments are computed outright rather than as a small update of a larger value, so they carry the kernel's
+// rounding at full scale and take only the max tolerance; a stale address or a stale beta moves them far more.
+void expect_close_to_reference(
+    const AdamWValues& expected, const AdamWValues& actual, const Tolerances& tolerances, const std::string& label) {
+    ASSERT_EQ(expected.param.shape(), actual.param.shape()) << label;
+    const auto [param_mean_error, param_max_error] = mean_and_max_error(expected.param, actual.param);
+    EXPECT_LT(param_mean_error, tolerances.mean_error) << label << ": param";
+    EXPECT_LT(param_max_error, tolerances.max_error) << label << ": param";
+    auto expect_close = [&](const xt::xarray<float>& reference, const xt::xarray<float>& result, const char* name) {
+        ASSERT_EQ(reference.shape(), result.shape()) << label << ": " << name;
+        EXPECT_LT(mean_and_max_error(reference, result).second, tolerances.max_error) << label << ": " << name;
+    };
+    expect_close(expected.exp_avg, actual.exp_avg, "exp_avg");
+    expect_close(expected.exp_avg_sq, actual.exp_avg_sq, "exp_avg_sq");
+    ASSERT_EQ(expected.max_exp_avg_sq.has_value(), actual.max_exp_avg_sq.has_value()) << label;
+    if (expected.max_exp_avg_sq.has_value()) {
+        expect_close(*expected.max_exp_avg_sq, *actual.max_exp_avg_sq, "max_exp_avg_sq");
+    }
+    EXPECT_EQ(count_bit_mismatches(expected.grad, actual.grad), 0U) << label << ": the gradient must not change";
+}
+
+void expect_bitwise_equal(const AdamWValues& expected, const AdamWValues& actual, const std::string& label) {
+    EXPECT_EQ(count_bit_mismatches(expected.param, actual.param), 0U) << label << ": param";
+    EXPECT_EQ(count_bit_mismatches(expected.grad, actual.grad), 0U) << label << ": grad";
+    EXPECT_EQ(count_bit_mismatches(expected.exp_avg, actual.exp_avg), 0U) << label << ": exp_avg";
+    EXPECT_EQ(count_bit_mismatches(expected.exp_avg_sq, actual.exp_avg_sq), 0U) << label << ": exp_avg_sq";
+    ASSERT_EQ(expected.max_exp_avg_sq.has_value(), actual.max_exp_avg_sq.has_value()) << label;
+    if (expected.max_exp_avg_sq.has_value()) {
+        EXPECT_EQ(count_bit_mismatches(*expected.max_exp_avg_sq, *actual.max_exp_avg_sq), 0U)
+            << label << ": max_exp_avg_sq";
+    }
+}
+
+// Guards against a vacuous pass: a hit that kept any one of the cached program's scalars must miss the reference.
+void expect_each_stale_scalar_detectable(
+    const AdamWLaunchTensors& tensors,
+    const FullPrecisionStepScalars& scalars,
+    const FullPrecisionStepScalars& cached) {
+    const auto expected = adamw_reference(tensors, scalars);
+    auto with = [&](auto take_cached) {
+        auto stale = scalars;
+        take_cached(stale);
+        return stale;
+    };
+    const std::array<std::pair<const char*, FullPrecisionStepScalars>, 6> stale_variants = {{
+        {"lr", with([&](auto& s) { s.lr = cached.lr; })},
+        {"beta1", with([&](auto& s) { s.beta1 = cached.beta1; })},
+        {"beta2", with([&](auto& s) { s.beta2 = cached.beta2; })},
+        {"beta powers", with([&](auto& s) { s.steps = cached.steps; })},
+        {"epsilon", with([&](auto& s) { s.epsilon = cached.epsilon; })},
+        {"weight_decay", with([&](auto& s) { s.weight_decay = cached.weight_decay; })},
+    }};
+    for (const auto& [name, stale] : stale_variants) {
+        if (stale == scalars) {
+            continue;  // not changed by this launch
+        }
+        const float mean_error = mean_and_max_error(expected.param, adamw_reference(tensors, stale).param).first;
+        EXPECT_GT(mean_error, kFp32Tolerances.mean_error) << "a stale " << name << " is too close to tell apart";
+    }
+}
+
+void expect_distinct_buffers(const AdamWLaunchTensors& a, const AdamWLaunchTensors& b) {
+    EXPECT_NE(a.param.tensor.buffer()->address(), b.param.tensor.buffer()->address());
+    EXPECT_NE(a.grad.tensor.buffer()->address(), b.grad.tensor.buffer()->address());
+    EXPECT_NE(a.exp_avg.tensor.buffer()->address(), b.exp_avg.tensor.buffer()->address());
+    EXPECT_NE(a.exp_avg_sq.tensor.buffer()->address(), b.exp_avg_sq.tensor.buffer()->address());
+    if (a.max_exp_avg_sq.has_value() && b.max_exp_avg_sq.has_value()) {
+        EXPECT_NE(a.max_exp_avg_sq->tensor.buffer()->address(), b.max_exp_avg_sq->tensor.buffer()->address());
+    }
+}
+
+// Launch A compiles the program. Launch B updates fresh states with the hash-excluded scalars changed. Launch C
+// updates fresh copies of launch A's states with launch A's scalars and must reproduce launch A bit for bit.
+void run_new_scalars_on_fresh_states(
+    bool amsgrad, const FullPrecisionStepScalars& scalars_b, const std::array<size_t, 4>& shape) {
+    auto& device = ttml::autograd::ctx().get_device();
+    constexpr uint32_t kSeedA = 1000U;
+
+    const auto a = make_launch_tensors(shape, amsgrad, kSeedA);
+    const auto entries_before_a = device.num_program_cache_entries();
+    const auto a_out = launch_adamw(a, kScalarsA);
+    ASSERT_GT(device.num_program_cache_entries(), entries_before_a) << "launch A must compile a program of its own";
+    EXPECT_EQ(a_out.buffer()->address(), a.param.tensor.buffer()->address()) << "AdamW updates the parameter in place";
+    const auto a_after = read_back(a);
+    expect_close_to_reference(adamw_reference(a, kScalarsA), a_after, kFp32Tolerances, "launch A");
+
+    const auto b = make_launch_tensors(shape, amsgrad, 2000U);
+    const auto entries_before_b = device.num_program_cache_entries();
+    launch_adamw(b, scalars_b);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_before_b) << "launch B must reuse launch A's program";
+    expect_distinct_buffers(a, b);
+    const auto b_after = read_back(b);
+    expect_close_to_reference(
+        adamw_reference(b, scalars_b), b_after, kFp32Tolerances, "launch B (cache hit, new scalars)");
+    expect_each_stale_scalar_detectable(b, scalars_b, kScalarsA);
+
+    const auto c = make_launch_tensors(shape, amsgrad, kSeedA);
+    const auto entries_before_c = device.num_program_cache_entries();
+    launch_adamw(c, kScalarsA);
+    EXPECT_EQ(device.num_program_cache_entries(), entries_before_c) << "launch C must reuse launch A's program";
+    expect_distinct_buffers(a, c);
+    expect_distinct_buffers(b, c);
+    expect_bitwise_equal(a_after, read_back(c), "launch C (launch A again, cache hit)");
+
+    expect_bitwise_equal(a_after, read_back(a), "launch A's buffers after the later launches");
+    expect_bitwise_equal(b_after, read_back(b), "launch B's buffers after launch C");
+}
+
+}  // namespace
+
+TEST_F(AdamWFullPrecisionCacheHitTest, NewScalarsOnFreshStates_TwoCoreGroups) {
+    run_new_scalars_on_fresh_states(/*amsgrad=*/false, kScalarsB, full_precision_two_core_group_shape());
+}
+
+// AMSGrad reads and writes max_exp_avg_sq as well and has a program of its own.
+TEST_F(AdamWFullPrecisionCacheHitTest, AmsgradNewScalarsOnFreshStates_TwoCoreGroups) {
+    run_new_scalars_on_fresh_states(/*amsgrad=*/true, kAmsgradScalarsB, full_precision_two_core_group_shape());
+}
+
+// One tile: one core, and no group-2 compute kernel to patch. The bf16 program of the same shape is cached first; the
+// program hash keys the dtype, so the fp32 launch A must still compile a program of its own.
+TEST_F(AdamWFullPrecisionCacheHitTest, NewScalarsOnFreshStates_OneTile) {
+    auto& device = ttml::autograd::ctx().get_device();
+    const std::array<size_t, 4> shape = {1U, 1U, 32U, 32U};
+
+    const auto bf16 = make_launch_tensors(shape, /*amsgrad=*/false, 900U, ttnn::DataType::BFLOAT16);
+    const auto entries_before = device.num_program_cache_entries();
+    launch_adamw(bf16, kScalarsA);
+    ASSERT_GT(device.num_program_cache_entries(), entries_before) << "the bf16 launch must compile a program";
+    const auto bf16_after = read_back(bf16);
+    expect_close_to_reference(adamw_reference(bf16, kScalarsA), bf16_after, kBf16Tolerances, "bf16 launch");
+
+    run_new_scalars_on_fresh_states(/*amsgrad=*/false, kScalarsB, shape);
+    expect_bitwise_equal(bf16_after, read_back(bf16), "the bf16 launch's buffers after the fp32 launches");
 }
