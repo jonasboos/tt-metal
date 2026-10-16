@@ -116,10 +116,22 @@ void kernel_main() {
     DataflowBuffer dfb_gamma(dfb_gamma_id);
     DataflowBuffer dfb_in(dfb_in_id);
     DataflowBuffer dfb_in_welford(dfb_in_welford_id);
-    const DataflowBuffer dfb_in0_welford(dfb_in0_welford_id);
     DataflowBuffer dfb_input_mask(dfb_input_mask_id);
     DataflowBuffer dfb_x(dfb_x_id);
     DataflowBuffer dfb_xmm(dfb_xmm_id);
+#ifdef TILIZE_IN
+#ifdef READER_REPACK
+    DataflowBuffer dfb_in_rm(dfb_repack_id);
+#else
+    DataflowBuffer dfb_in_rm(dfb_in0_id);
+#endif
+#endif
+#ifdef UNTILIZE_OUT
+    DataflowBuffer write_dfb(dfb_untilize_in_id);
+    DataflowBuffer dfb_untilize_out(dfb_untilize_out_id);
+#else
+    DataflowBuffer write_dfb(dfb_out0_id);
+#endif
 
 // tilize input from RM to tile layout
 #ifdef TILIZE_IN
@@ -133,7 +145,8 @@ void kernel_main() {
         dfb_in_id,
         compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
         compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
-        compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(per_core_M);
+        compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(
+        dfb_in_rm, dfb_in, per_core_M);
 #else
     constexpr std::uint32_t dfb_in_rm_id = dfb_in0_id;
     compute_kernel_lib::tilize<
@@ -142,7 +155,8 @@ void kernel_main() {
         dfb_in_id,
         compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
         compute_kernel_lib::tilize_config::WaitMode::NoWait,
-        compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(per_core_M);
+        compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(
+        dfb_in_rm, dfb_in, per_core_M);
 #endif  // READER_REPACK
     dfb_in.wait_front(per_core_MN);
     if constexpr (welford_fp32_alias) {
@@ -607,7 +621,6 @@ void kernel_main() {
 #else
                 auto write_dfb_id = dfb_out0_id;
 #endif
-                DataflowBuffer write_dfb(static_cast<uint16_t>(write_dfb_id));
                 write_dfb.reserve_back(1);
                 tile_regs_wait();
 #ifndef UNTILIZE_OUT
@@ -666,6 +679,7 @@ void kernel_main() {
         dfb_untilize_out_id,
         compute_kernel_lib::untilize_config::InitUninitMode::InitAndUninit,
         compute_kernel_lib::untilize_config::WaitMode::WaitUpfront,
-        compute_kernel_lib::untilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(per_core_M);
+        compute_kernel_lib::untilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(
+        write_dfb, dfb_untilize_out, per_core_M);
 #endif
 }

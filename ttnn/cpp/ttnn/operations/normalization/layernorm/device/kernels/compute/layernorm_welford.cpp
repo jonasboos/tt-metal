@@ -89,7 +89,11 @@ void kernel_main() {
 #ifdef FUSE_BETA
     DataflowBuffer dfb_beta_obj(dfb_beta);
 #endif
+#ifdef COMPACT_FP32_FINALIZER
+    auto& dfb_xmm_obj = dfb_in_obj;
+#else
     DataflowBuffer dfb_xmm_obj(dfb_xmm);
+#endif
     DataflowBuffer dfb_ex_obj(dfb_ex);
     DataflowBuffer dfb_ex2_obj(dfb_ex2);
     DataflowBuffer dfb_ex2pe_obj(dfb_ex2pe);
@@ -587,12 +591,12 @@ void kernel_main() {
     // So pop total_buffer_size once here rather than per block.
 #ifdef FUSE_GAMMA
     if constexpr (do_gamma) {
-        DataflowBuffer(dfb_gamma).pop_front(static_cast<uint16_t>(total_buffer_size));
+        dfb_gamma_obj.pop_front(static_cast<uint16_t>(total_buffer_size));
     }
 #endif
 #ifdef FUSE_BETA
     if constexpr (do_beta) {
-        DataflowBuffer(dfb_beta).pop_front(static_cast<uint16_t>(total_buffer_size));
+        dfb_beta_obj.pop_front(static_cast<uint16_t>(total_buffer_size));
     }
 #endif
 }
