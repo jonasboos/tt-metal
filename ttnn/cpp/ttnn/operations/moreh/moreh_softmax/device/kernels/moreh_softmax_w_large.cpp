@@ -29,6 +29,8 @@ void kernel_main() {
     DataflowBuffer dfb_exps_obj(dfb::exps);
     DataflowBuffer dfb_add_obj(dfb::add);
     DataflowBuffer dfb_out0_obj(dfb::out0);
+    DataflowBuffer dfb_max_scaler_obj(dfb::max_scaler);
+    DataflowBuffer dfb_sum_scaler_obj(dfb::sum_scaler);
 
     compute_kernel_hw_startup(dfb::in0, dfb::max_scaler, dfb::out0);
 
@@ -45,19 +47,22 @@ void kernel_main() {
                 dfb_in0_obj, dfb_mask_obj, dfb_tmp_obj, 0, 0, /*pop0=*/1, /*popm=*/0);
 
             compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, dfb::tmp, dfb::max_scaler, dfb::max>(
-                compute_kernel_lib::ReduceInputBlockShape::single());
+                dfb_tmp_obj, dfb_max_scaler_obj, dfb_max_obj, compute_kernel_lib::ReduceInputBlockShape::single());
         } else {
             // Phase 1: reduce Wt-1 full tiles into dfb::max (no accumulation, first call).
             compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, dfb::in0, dfb::max_scaler, dfb::max>(
-                compute_kernel_lib::ReduceInputBlockShape::row(Wt - 1));
+                dfb_in0_obj, dfb_max_scaler_obj, dfb_max_obj, compute_kernel_lib::ReduceInputBlockShape::row(Wt - 1));
 
             // Phase 2: mask the last tile and continue reducing into dfb::max via Accumulate.
             mask_tile_to_dfb<dfb::in0, dfb::mask, dfb::tmp>(
                 dfb_in0_obj, dfb_mask_obj, dfb_tmp_obj, 0, 0, /*pop0=*/1, /*popm=*/0);
             compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, dfb::tmp, dfb::max_scaler, dfb::max>(
+                dfb_tmp_obj,
+                dfb_max_scaler_obj,
+                dfb_max_obj,
                 compute_kernel_lib::ReduceInputBlockShape::row(1),
                 compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
-                compute_kernel_lib::Accumulate::at(dfb::max, /*iter=*/1));
+                compute_kernel_lib::Accumulate(dfb_max_obj, /*iter=*/1));
         }
 
         for (uint32_t w = 0; w < Wt; ++w) {
@@ -108,6 +113,9 @@ void kernel_main() {
             dfb::sum_scaler,
             dfb::recip_sum_exps,
             ckl::ReduceInputPolicy::BulkWaitBulkPop>(
+            dfb_add_obj,
+            dfb_sum_scaler_obj,
+            dfb_recipsumexps_obj,
             ckl::ReduceInputBlockShape::single(),
             ckl::ReduceInputMemoryLayout::contiguous(),
             ckl::NoAccumulation{},
@@ -124,6 +132,9 @@ void kernel_main() {
             dfb::sum_scaler,
             dfb::recip_sum_exps,
             ckl::ReduceInputPolicy::BulkWaitBulkPop>(
+            dfb_add_obj,
+            dfb_sum_scaler_obj,
+            dfb_recipsumexps_obj,
             ckl::ReduceInputBlockShape::single(),
             ckl::ReduceInputMemoryLayout::contiguous(),
             ckl::NoAccumulation{},

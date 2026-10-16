@@ -54,7 +54,7 @@ void kernel_main() {
                 dfb_in0_obj, dfb_mask_obj, dfb_tmp_obj, 0, 0, /*pop0=*/0, /*popm=*/0);
 
             ckl::reduce<PoolType::MAX, ReduceDim::REDUCE_COL, dfb::tmp, dfb::max_scaler, dfb::max>(
-                ckl::ReduceInputBlockShape::single());
+                dfb_tmp_obj, dfb_max_scaler_obj, dfb_max_obj, ckl::ReduceInputBlockShape::single());
         } else {
             ckl::reduce<
                 PoolType::MAX,
@@ -63,14 +63,17 @@ void kernel_main() {
                 dfb::max_scaler,
                 dfb::max,
                 compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop>(
-                compute_kernel_lib::ReduceInputBlockShape::col(Ht - 1));
+                dfb_in0_obj, dfb_max_scaler_obj, dfb_max_obj, compute_kernel_lib::ReduceInputBlockShape::col(Ht - 1));
 
             mask_tile_to_dfb<dfb::in0, dfb::mask, dfb::tmp>(
                 dfb_in0_obj, dfb_mask_obj, dfb_tmp_obj, Ht - 1, 0, /*pop0=*/0, /*popm=*/0);
             compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_COL, dfb::tmp, dfb::max_scaler, dfb::max>(
+                dfb_tmp_obj,
+                dfb_max_scaler_obj,
+                dfb_max_obj,
                 compute_kernel_lib::ReduceInputBlockShape::single(),
                 compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
-                compute_kernel_lib::Accumulate::at(dfb::max, 1));  // iteration=1, reload from dfb::max
+                compute_kernel_lib::Accumulate(dfb_max_obj, 1));  // iteration=1, reload from dfb::max
         }
 
         // compute x - max(x)
@@ -137,6 +140,9 @@ void kernel_main() {
             dfb::sum_scaler,
             dfb::recip_sum_exps,
             ckl::ReduceInputPolicy::BulkWaitBulkPop>(
+            dfb_exps_obj,
+            dfb_sum_scaler_obj,
+            dfb_recipsumexps_obj,
             ckl::ReduceInputBlockShape::col(Ht),
             ckl::ReduceInputMemoryLayout::contiguous(),
             ckl::NoAccumulation{},
@@ -153,6 +159,9 @@ void kernel_main() {
             dfb::sum_scaler,
             dfb::recip_sum_exps,
             ckl::ReduceInputPolicy::WaitUpfrontNoPop>(
+            dfb_exps_obj,
+            dfb_sum_scaler_obj,
+            dfb_recipsumexps_obj,
             ckl::ReduceInputBlockShape::col(Ht),
             ckl::ReduceInputMemoryLayout::contiguous(),
             ckl::NoAccumulation{},
