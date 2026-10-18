@@ -46,6 +46,7 @@ struct UpdatePaddedKvCacheDeviceOperation {
         // KV dedup: second axis to also shard the cache across. The input stays TP-replicated and each chip
         // persists only its own 1/tp window; the axes linearize to one block-cyclic axis of size sp*tp.
         std::optional<uint32_t> tp_axis;
+        std::optional<uint32_t> stripe_size;
     };
 
     struct tensor_args_t {
@@ -140,6 +141,7 @@ ttnn::Tensor update_padded_kv_cache(
     std::optional<uint32_t> valid_global = std::nullopt,
     std::optional<uint32_t> tp_axis = std::nullopt,
     const std::optional<ttnn::Tensor>& rope = std::nullopt,
-    const std::optional<ttnn::Tensor>& scales = std::nullopt);
+    const std::optional<ttnn::Tensor>& scales = std::nullopt,
+    std::optional<uint32_t> stripe_size = std::nullopt);
 
 }  // namespace ttnn::prim

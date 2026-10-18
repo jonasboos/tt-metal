@@ -142,6 +142,15 @@ class PrefillModelAdapter(ABC):
     dflash_golden_default: str = ""
     supports_mtp: bool = False
 
+    def prefill_metadata_size_bytes(self, chunk_size, cp, num_users):
+        return 12
+
+    def decode_prefill_metadata(self, words):
+        return dict(zip(("slot_id", "actual_start", "actual_end"), map(int, words[:3])))
+
+    def create_prefill_sender(self, send, *, chunk_size, cp, num_users, max_seq_len):
+        return None
+
     def fabric_payload_size(self) -> int:
         """The fabric packet payload the mesh is opened with. It is fixed at mesh open, before the model is
         built, so a model whose ops need more room than ``model_config.FABRIC_PAYLOAD_SIZE`` returns it here."""
