@@ -1218,8 +1218,8 @@ inline void bitonic_sort_len_k(bool ascending)
 //   Pass 1 (lo16) : copy the low 16 bits of each Dst word into SrcA via
 //                   SrcB+TRNSPSRCB+MOVB2A, then write them back to Dst.
 //   Pass 2 (hi16) : same shuffle for the high 16 bits, then write back to
-//                   Dst with Fp32_enabled=0 so the writeback preserves the
-//                   already-stored hi16 half.
+//                   Dst with INT8_math_enabled in place of Fp32_enabled so the
+//                   writeback preserves the already-stored hi16 half.
 //
 // Entry/exit invariant: Fp32_enabled = 1 (needed for 32-bit Dst reads).
 
@@ -1227,6 +1227,7 @@ inline void bitonic_sort_len_k(bool ascending)
 template <int dst_offset>
 inline void transpose_dest_face_32b()
 {
+    std::uint32_t int8_math_enabled;
     // Transpose low 16 bits and backup it in SrcA
     cfg_reg_rmw_tensix<ALU_FORMAT_SPEC_REG0_SrcA_RMW>(to_underlying(DataFormat::Float16_b));
     TTI_MOVD2B(1, 16, ADDR_MOD_7, p_movd2b::MOV_4_ROWS, dst_offset + 0);
@@ -1256,15 +1257,15 @@ inline void transpose_dest_face_32b()
     TTI_MOVB2D(0, 24, ADDR_MOD_7, p_movb2d::MOV_4_ROWS, dst_offset + 8);
     TTI_MOVB2D(0, 28, ADDR_MOD_7, p_movb2d::MOV_4_ROWS, dst_offset + 12);
 
-    // lo16 writeback: Fp32_enabled=0 + SrcA=Float32 -> writes lo16, preserves hi16
-    cfg_reg_rmw_tensix<ALU_ACC_CTRL_Fp32_enabled_RMW>(0);
+    // lo16 writeback: INT8_math_enabled in place of Fp32_enabled + SrcA=Float32 -> writes lo16, preserves hi16
+    int8_math_enabled = _dest_32b_lo_moves_begin_();
     cfg_reg_rmw_tensix<ALU_FORMAT_SPEC_REG0_SrcA_RMW>(to_underlying(DataFormat::Float32));
 
     TTI_MOVA2D(1, 0, ADDR_MOD_7, p_mova2d::MOV_8_ROWS, dst_offset + 0);
     TTI_MOVA2D(1, 8, ADDR_MOD_7, p_mova2d::MOV_8_ROWS, dst_offset + 8);
 
-    // Restore Fp32_enabled=1 for subsequent 32-bit Dst access
-    cfg_reg_rmw_tensix<ALU_ACC_CTRL_Fp32_enabled_RMW>(1);
+    // Restore Fp32_enabled=1 and INT8_math_enabled for subsequent 32-bit Dst access
+    _dest_32b_lo_moves_end_(int8_math_enabled);
 }
 
 // `enter_transpose_cfg_block` / `leave_transpose_cfg_block` wrap a group of
