@@ -555,13 +555,14 @@ class TtPrefillRuntime:
         ttnn.deallocate(ids_block)
         return union, hidden, None
 
-    def make_placeholder_activation(self, dflash_packed: bool = True) -> ttnn.Tensor:
+    def make_placeholder_activation(self, dflash_packed: bool = True, planes: Optional[int] = None) -> ttnn.Tensor:
         """Allocate a zero activation matching what the D2D socket delivers, per chip.
 
         Stand-in input for a non-first rank until the upstream sync op overwrites it in place. Both
         packed forms are sized here -- DFlash widens, MTP heightens -- and `_prepare_trace` captures it.
 
-        ``dflash_packed=False`` asks for the hidden-only width under DFlash, which the traced path needs.
+        ``dflash_packed=False`` asks for the hidden-only width under DFlash, which the traced path needs;
+        ``planes`` overrides the plane count (the drafter partial is one plane).
         """
         rows = (
             d2d_activation_rows(
@@ -572,7 +573,8 @@ class TtPrefillRuntime:
         emb_per_tp = d2d_activation_width(
             self.hf_config.hidden_size, dflash=(self.config.dflash_enabled and dflash_packed)
         ) // (self.config.tp_factor)
-        zeros = torch.zeros(1, self.activation_planes, rows, emb_per_tp, dtype=torch.bfloat16)
+        planes = self.activation_planes if planes is None else planes
+        zeros = torch.zeros(1, planes, rows, emb_per_tp, dtype=torch.bfloat16)
         return ttnn.from_torch(
             zeros,
             device=self.mesh_device,
@@ -965,8 +967,8 @@ class TtPrefillRuntime:
         chunk = self.config.chunk_size
         if self.config.dflash_enabled and not self.config.is_first_rank:
             self._trace_input = self.make_placeholder_activation(dflash_packed=False)
-            # The capture reads the upstream partial here; same shape as the hidden half.
-            self._trace_partial_in = self.make_placeholder_activation(dflash_packed=False)
+            # The capture reads the upstream partial here; one plane of the hidden's width.
+            self._trace_partial_in = self.make_placeholder_activation(dflash_packed=False, planes=1)
         else:
             self._trace_input = self.make_chunk_input([0] * chunk)
         if self.config.mtp_levels and self.config.is_first_rank:
