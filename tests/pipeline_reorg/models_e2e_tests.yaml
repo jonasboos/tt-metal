@@ -1564,7 +1564,7 @@
   model: wan-2.2-t2v
   model_family: Wan
   skus:
-    bh_sc1:
+    bh_sc1_high_power:
       timeout: 45
       tier: 1
       release_ready: true

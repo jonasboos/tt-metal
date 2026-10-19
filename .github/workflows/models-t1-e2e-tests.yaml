@@ -54,6 +54,7 @@ on:
           - "bh_quietbox_2 (BH QB2)"
           - "bh_galaxy (BH Galaxy)"
           - "bh_sc1 (BH Single Galaxy)"
+          - "bh_sc1_high_power (BH SC1 High Power)"
           - "bh_sc4 (BH Supercluster 4)"
           # Dispatch-only: excluded from scheduled ALL_SKUS so cron runs don't allocate
           # scarce SC16 hardware. Enabled in package-and-release via release-build-test-publish.
