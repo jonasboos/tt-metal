@@ -367,6 +367,7 @@ inline void eltwise_unary_configure_mop(std::uint32_t rows_per_inst, std::uint32
         if (((is_fp32_dest_acc_en || is_int_fpu_en) && !(dst_format == to_underlying(DataFormat::UInt16))) || (dst_format == to_underlying(DataFormat::UInt8)))
         {
             // use elwadd to handle unpacking data into src A as fp16, but dest is in fp32 mode OR to handle uint8 datums
+            math::_configure_elw_zero_flag_state_();
             ckernel_template tmp(outerloop, innerloop, TT_OP_ELWADD(0, 0, p_elwise::SRCB_NO_BCAST, ADDR_MOD_2, 0));
             tmp.set_end_op(TT_OP_SETRWC(p_setrwc::CLR_AB, 0, 0, 0, 0, p_setrwc::SET_AB));
             tmp.program();
@@ -432,6 +433,7 @@ inline void eltwise_unary_configure_mop(std::uint32_t rows_per_inst, std::uint32
             }
             else
             {
+                math::_configure_elw_zero_flag_state_();
                 ckernel_template tmp(outerloop, innerloop, TT_OP_ELWADD(0, 0, broadcast_type, addr_mod, 0));
                 tmp.set_end_op(TT_OP_SETRWC(p_setrwc::CLR_AB, 0, 0, 0, 0, 0));
                 tmp.program();
@@ -448,6 +450,7 @@ inline void eltwise_unary_configure_mop(std::uint32_t rows_per_inst, std::uint32
             }
             else // ELWADD is used for non UInt16 case, since it moves 8 rows per cycle
             {
+                math::_configure_elw_zero_flag_state_();
                 ckernel_template tmp(outerloop, innerloop, TT_OP_ELWADD(0, 0, broadcast_type, addr_mod, 0));
                 tmp.set_end_op(TT_OP_SETRWC(0, p_setrwc::CR_B, 0, 0, 0, p_setrwc::SET_B));
                 tmp.program();

@@ -336,6 +336,7 @@ inline void _llk_math_face_compressed_mm_init_(const std::uint32_t face_r_dim)
     _llk_math_face_compressed_mm_addrmod_config_(face_r_dim);
     _llk_math_face_compressed_mm_mop_config_<ct_dim>(face_r_dim);
 
+    math::_configure_elw_zero_flag_state_(); // ELW* need the Src zero flag clear
     math::reset_counters(p_setrwc::SET_ABD_F);
 }
 

@@ -148,6 +148,7 @@ inline void _llk_math_compressed_custom_mm_init_(const std::uint32_t operandB_fa
     _llk_math_compressed_custom_mm_addrmod_config_<transpose, split_acc, dense_packing>();
     _llk_math_compressed_custom_mm_mop_config_(operandB_face_r_dim);
 
+    math::_configure_elw_zero_flag_state_(); // ELW* need the Src zero flag clear
     math::reset_counters(p_setrwc::SET_ABD_F);
 }
 
