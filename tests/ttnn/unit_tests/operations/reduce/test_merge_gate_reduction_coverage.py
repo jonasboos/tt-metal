@@ -8,6 +8,8 @@ Each case targets one regression the merge-gate selection still misses.
 Marks are added only after Sanity history and the promotion checklist.
 """
 
+import os
+
 import pytest
 
 pytestmark = pytest.mark.use_module_device
@@ -44,6 +46,35 @@ def _factory_names_contain(factories, token):
 # ---------------------------------------------------------------------------
 # N3 — LLK numerics state
 # ---------------------------------------------------------------------------
+
+# A 32x32 TILE has four 16x16 faces. #49715's reduce_row SUM/AVG fast path unpacks all four in
+# one UNPACR; distinct face constants catch a mix that random tiles and loose PCC miss.
+_FACE = 16
+_TILE = 32
+
+
+def _tile_with_distinct_faces(dtype):
+    tile = torch.empty((_TILE, _TILE), dtype=dtype)
+    tile[:_FACE, :_FACE] = 1
+    tile[:_FACE, _FACE:] = 2
+    tile[_FACE:, :_FACE] = 3
+    tile[_FACE:, _FACE:] = 4
+    return tile
+
+
+@pytest.mark.parametrize("op", [ttnn.sum, ttnn.mean], ids=["sum", "mean"])
+@pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.float32], ids=["bf16", "fp32"])
+def test_reduce_row_distinct_tile_faces(device, op, dtype):
+    torch_dtype = torch.float32 if dtype == ttnn.float32 else torch.bfloat16
+    torch_input = _tile_with_distinct_faces(torch_dtype).unsqueeze(0)
+    torch_op = torch.sum if op == ttnn.sum else torch.mean
+    # These four constants and a 32-wide row are exact in bf16 and fp32, so a face mix cannot hide
+    # inside rounding. atol is 0.
+    expected = torch_op(torch_input, dim=-1, keepdim=True)
+
+    tt_input = ttnn.from_torch(torch_input, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    got = ttnn.to_torch(op(tt_input, dim=-1, keepdim=True))
+    assert torch.equal(expected, got), f"{op.__name__} {dtype} row reduce mixed tile faces"
 
 
 @pytest.mark.parametrize("op_name", ["max", "min"], ids=["max", "min"])
@@ -140,6 +171,13 @@ def test_integer_reduce_returns_result_or_raises(device, op_name, ttnn_op, torch
     # Positive values so UINT32 and INT32 share the same host tensor.
     host = torch.randint(1, 1000, (1, 1, 32, 32), dtype=torch.int64)
     torch_input = host.to(torch_dtype)
+    # UINT32 sum/max/min pass validation but run the FPU path (bits reinterpreted as
+    # float, not integer-exact). Hardware returns a non-zero result; ttsim kills the
+    # pytest worker on that unpack (xdist: "node down: Not properly terminated").
+    uint32_fpu_reduce = dtype == ttnn.uint32 and op_name in ("sum", "max", "min")
+    if uint32_fpu_reduce and os.environ.get("TT_METAL_SIMULATOR"):
+        pytest.skip("UINT32 sum/max/min take the FPU path; ttsim crashes the worker on that unpack")
+
     tt_input = ttnn.from_torch(host, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
 
     try:
@@ -152,10 +190,9 @@ def test_integer_reduce_returns_result_or_raises(device, op_name, ttnn_op, torch
     assert not (
         torch.all(got == 0) and not torch.all(expected == 0)
     ), f"{op_name} on {dtype} returned silent zeros; expected {expected.flatten()[:8].tolist()}"
-    # UINT32 sum/max/min are accepted by validation but run the FPU path, which reinterprets
-    # the bits as float and is not integer-exact. The contract for that path is "not silent
-    # zeros"; INT32 sum/max/min and every op that returns a result must match torch.
-    if dtype == ttnn.uint32 and op_name in ("sum", "max", "min"):
+    # FPU UINT32 is "not silent zeros" only. INT32 sum/max/min and every op that
+    # returns a result must match torch.
+    if uint32_fpu_reduce:
         return
     assert_equal(expected, got)
 
