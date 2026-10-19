@@ -2,7 +2,43 @@
 
 Issue: https://github.com/tenstorrent/tt-metal/issues/60670
 
-Status: **in progress, root cause not yet confirmed.** These findings come from static analysis
+Status: **Not a tt-metal code regression (confirmed 2026-10-19 by CI probe A).** The last good
+nightly's exact commit and Docker image now reproduce the slow VAE. The cause is an environment
+change on the BH single-galaxy CI machines around the morning of 2026-09-15. See "Probe results"
+directly below. The earlier sections are kept for history; their code-window narrowing is
+superseded.
+
+## Probe results (2026-10-17, dispatched `models-t1-e2e-tests.yaml`, `wan-2.2-t2v`, `bh_sc1`)
+
+| Probe | Ref | Docker image | 480p VAE | 720p VAE | Run |
+|---|---|---|---|---|---|
+| 09-14 nightly (original) | `f8c4ce59dd0` | `2be5f2ab…` | 0.324 s | 0.676 s | 34799396959 |
+| **A** | `f8c4ce59dd0` (same commit) | `2be5f2ab…` (same image) | **0.752 s** | **1.021 s** | 38959412196 |
+| B | `656f87fcdb4` | n/a | 0.726 s | 1.015 s | 38959415458 |
+| C | `656f87fcdb4` + UMD `f70cc57f7f8` | n/a | infra failure, no test ran | n/a | 38959418717 |
+
+- Same code and same image as the good run, yet slow now. The tt-dit weight cache is cold
+  ("Cache does not exist ... Writing cache") in every run, old and new, so a stale persisted cache
+  is ruled out. The Hugging Face fetch counts are identical.
+- **Machine change on 2026-09-15:** in the 09-15 nightly (run 34921216342, created 02:27 UTC), every
+  `bh_sc1` job waited about 10.5 h and started between 12:56 and 13:18 UTC. That suggests the pool
+  was down or under maintenance that morning. The first jobs after it came back are the first slow
+  ones. Their pytest timeouts are consistent with fresh machines recompiling every kernel.
+- KMD/firmware alone don't explain it. 09-14 (good) and 09-16 (bad) both report KMD 2.10.0 and
+  firmware bundle 19.12.0. The probes ran on today's machines (pool `multihost-ci-sc1-r4rn9`,
+  KMD 2.11.0, firmware 19.16.0) and are slow there too. The change is something else on the hosts
+  or devices that persisted across this later upgrade: host OS or kernel, CPU frequency or power
+  settings, PCIe/IOMMU or hugepage configuration, board power or thermal settings, or the
+  hardware itself.
+- The probe A denoise time (39.5 s at 480p vs about 57 s on 09-14) also differs by host, matching
+  the bimodal runner behaviour noted in the issue.
+
+**Asks:**
+
+1. CI/infra: what changed on the BH sc1 (`multihost-ci-sc1-*`) machines on 2026-09-14/15?
+2. Re-baseline the `vae` targets in `t2v_metrics()` for BH 4x8 to the current machines (about
+   0.75 s at 480p and 1.05 s at 720p, plus tolerance), so the job goes green and the 720p
+   pipeline quality test runs again. Do this unless infra can restore the old configuration. These findings come from static analysis
 of the commit window and from CI job logs. Nothing was run on hardware (the local galaxy was
 unavailable).
 
