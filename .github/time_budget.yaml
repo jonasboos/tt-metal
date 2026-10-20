@@ -119,10 +119,10 @@ ttnn:
   unit_tier3:
     wh_n150: 4
   device_perf:
-    bh_p150b_civ2: 229
+    bh_p150b_civ2: 235
     wh_n150: 10
     wh_llmbox_perf: 8
-    wh_n300_civ2: 216
+    wh_n300_civ2: 222
   integration:
     wh_llmbox: 30
     wh_galaxy: 100
