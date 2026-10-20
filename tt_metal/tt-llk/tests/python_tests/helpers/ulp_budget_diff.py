@@ -4,13 +4,14 @@
 """Whether a change to the SFPU accuracy table loosens a gate, and whether the
 hardware still fits the gates it declares.
 
-* ``diff``: what a pull request does to the budgets. A budget that goes up, a row that
-  stops being gated, or a tolerance cell whose recorded measurement or declared
-  ``atol``/``rtol`` loosens, is a *regression* whatever the reason; the table's rule is
-  that it may only happen alongside a fresh measurement. No hardware needed.
+* ``diff``: what a pull request does to the budgets. A gate is a row's ``measured``
+  figure, so a figure that goes up, a row that stops being gated, or a tolerance cell
+  whose recorded measurement or declared ``atol``/``rtol`` loosens, is a *regression*
+  whatever the reason; the table's rule is that it may only happen as a measurement of
+  its own, in a change of its own. No hardware needed.
 * ``headroom``: what the hardware measured, from the ``--ulp-measure`` rows, against
-  the budgets. The sweep already fails a cell it cannot meet; this says which budgets
-  are about to become regressions, and judges the tolerance cells the sweep cannot.
+  the figures. The sweep already fails a cell over its figure; this judges the tolerance
+  cells the sweep cannot, and says which cells now measure better than their row.
 
 Standalone on purpose -- ``yaml``, the standard library and the sibling
 ``ulp_provenance`` (itself the same), so it runs without the LLK environment and can
@@ -62,7 +63,8 @@ MEASURED_ARCH = "WORMHOLE"
 ULP_GATED_OUTPUTS = frozenset({"Float16_b", "Float16", "Float32", "Bfp8_b"})
 
 #: The fields a row may carry beyond its key: ``sfpu_accuracy_budget._CONTRACT_FIELDS``.
-CONTRACT_FIELDS = frozenset({"metric", "max_ulp", "atol", "rtol", "near_zero_atol"})
+#: A ULP row's gate is its ``measured`` figure, a provenance field.
+CONTRACT_FIELDS = frozenset({"metric", "atol", "rtol", "near_zero_atol"})
 
 #: The sweep's skip reasons for a cell it measured and recorded but does not gate. A
 #: skip that does not carry it (off Wormhole, ``--compile-producer``) wrote nothing.
@@ -71,20 +73,10 @@ RECORDED_SKIP = "measured, not gated"
 #: A cell identity: the op plus whichever key dimensions the row pins.
 Cell = Tuple[str, Tuple[Tuple[str, str], ...]]
 
-#: An informational section (other budget changes, headroom, slack) shows this many
-#: rows and says how many it withheld. A list of what failed or loosened is never cut.
+#: An informational section (other budget changes, cells measuring better than their
+#: row) shows this many rows and says how many it withheld. A list of what failed or
+#: loosened is never cut.
 _MAX_ROWS = 40
-
-#: Below this fraction of its budget a cell carries slack the sweep cannot justify. Not
-#: a failure -- tightening is a deliberate change with its own measurement -- but it is
-#: the list someone should work through.
-_SLACK_FRACTION = 0.5
-
-#: The smallest budget the slack list considers. A budget of 1 measured at 0 is the
-#: emitter's floor for a strided Float32 cell, where a sample cannot prove the 0 holds
-#: over the lanes it skipped (``ulp_sweep._verdict``); the only tighter budget is the 0
-#: the emitter deliberately refused to write.
-_SLACK_MIN_BUDGET = 2
 
 
 def _cell_name(op: str, key: Tuple[Tuple[str, str], ...]) -> str:
@@ -231,13 +223,11 @@ def _check_row(where: str, fields: dict) -> None:
         if fields.get(name) is not None:
             _check_number(where, name, fields[name])
     if metric == "ulp":
-        if fields.get("max_ulp") is None:
-            raise ValueError(f"{where}: a ulp row needs max_ulp")
-        _check_number(where, "max_ulp", fields["max_ulp"], integer=True)
+        # check_provenance refused a ulp row without its `measured` figure already.
         if fields.get("atol") is not None or fields.get("rtol") is not None:
             raise ValueError(f"{where}: atol/rtol belong to the tolerance metric")
-    elif fields.get("max_ulp") is not None or fields.get("near_zero_atol") is not None:
-        raise ValueError(f"{where}: max_ulp/near_zero_atol belong to the ulp metric")
+    elif fields.get("near_zero_atol") is not None:
+        raise ValueError(f"{where}: near_zero_atol belongs to the ulp metric")
     for flag in ("approx", "dest"):
         if fields.get(flag) is not None and key_value(fields[flag]) not in (
             "Yes",
@@ -566,12 +556,14 @@ def _remeasured(
     kind: str = "",
     resolved_before: Optional[Row] = None,
 ) -> Optional[bool]:
-    """Whether *row*, the head row deciding a cell, carries provenance the base table's
-    same row did not; a row counts only with provenance fields of its own, and an alias
-    row only with provenance new to the whole base. ``None`` for a widened bound when
-    neither *row* on either side nor *resolved_before*, the row the cell resolved to in
-    the base, records a measurement (see :class:`Change`); any other loosening is held
-    to the rule, an ungating one too."""
+    """Whether *row*, the head row deciding a cell, was measured again: its ``run`` or
+    ``sampled`` date differs from the same row's in the base table. The figure is the
+    gate, so a figure that moved under an unchanged date is a number edited, not a
+    measurement; a new row counts with a date of its own, and an alias row only with a
+    date new to the whole base. ``None`` for a widened bound when neither *row* on
+    either side nor *resolved_before*, the row the cell resolved to in the base, records
+    a measurement (see :class:`Change`); any other loosening is held to the rule, an
+    ungating one too."""
     if row is None:
         return False
     was = base.get((row.op, row.key))
@@ -580,24 +572,24 @@ def _remeasured(
     )
     if kind == "tolerance_widened" and row.declares_tolerance and unrecorded:
         return None
-    # Dropping a measurement is not taking one: the head row needs fields of its own.
-    if row.provenance == Provenance():
+    # Dropping a measurement is not taking one: the head row needs a date of its own.
+    if row.provenance.when is None:
         return False
     if row.alias:
         # `Neg: *low` -> `*high` hands Neg the measurement `&high` already carried.
-        return row.provenance not in _provenances(base)
-    return was is None or was.provenance != row.provenance
+        return row.provenance.when not in _dates(base)
+    return was is None or was.provenance.when != row.provenance.when
 
 
-#: Every provenance a table records, built once per table, for :func:`_remeasured`.
-_PROVENANCES: Dict[int, Tuple[Dict[Cell, Row], frozenset]] = {}
+#: Every date a table records, built once per table, for :func:`_remeasured`.
+_DATES: Dict[int, Tuple[Dict[Cell, Row], frozenset]] = {}
 
 
-def _provenances(table: Dict[Cell, Row]) -> frozenset:
-    cached = _PROVENANCES.get(id(table))
+def _dates(table: Dict[Cell, Row]) -> frozenset:
+    cached = _DATES.get(id(table))
     if cached is None or cached[0] is not table:
-        found = frozenset(r.provenance for r in table.values())
-        cached = _PROVENANCES[id(table)] = (table, found)
+        found = frozenset(r.provenance.when for r in table.values())
+        cached = _DATES[id(table)] = (table, found)
     return cached[1]
 
 
@@ -656,10 +648,10 @@ def render_budget_diff(changes: List[Change]) -> str:
     out = ["### SFPU ULP budgets", ""]
     if regressions:
         out += [
-            f"**{len(regressions)} cell(s) loosen a gate.** A budget may only be raised "
-            "by re-measuring and updating that row's `measured` figure and its date in "
-            "the same change — that is the table's own rule, and it is what makes "
-            "every number in it traceable.",
+            f"**{len(regressions)} cell(s) loosen a gate.** A gate is the row's "
+            "`measured` figure, so raising it is recording a worse measurement, with "
+            "its date, in a change of its own — that is the table's own rule, and it "
+            "is what makes every number in it traceable.",
             "",
             *_md_table(
                 ("cell", "change", "before", "after", "re-measured"),
@@ -883,10 +875,11 @@ def render_headroom(
 ) -> Tuple[str, int]:
     """The report, and the regression count the command fails on.
 
-    A gated cell is judged against its budget; the sweep already fails one it cannot
-    meet, so the value here is which cells have no headroom left or carry slack. A
-    tolerance cell has no budget and the sweep passes it whatever it measures, so it is
-    judged against the measurement its own row records, and only this report sees it.
+    A gated cell is judged against its figure; the sweep already fails one over it, so
+    the value here is which cells now measure better than their row (a re-emit tightens
+    them). A tolerance cell has no budget and the sweep passes it whatever it measures,
+    so it is judged against the measurement its own row records, and only this report
+    sees it.
     The same holds for a cell the sweep could not measure: an overflow is recorded as a
     lane count, and more such lanes than its row accounts for is a regression too.
 
@@ -905,8 +898,7 @@ def render_headroom(
     """
     over: List[str] = []
     regressed: List[str] = []
-    tight: List[str] = []
-    slack: List[str] = []
+    better: List[str] = []
     unjudged = 0
     uncovered = 0
     empty = set(empty)
@@ -938,12 +930,11 @@ def render_headroom(
         elif worst > row.max_ulp:
             over.append(_headroom_line(cell, worst, row.max_ulp, "over budget"))
             listed.add(_same_cell(cell))
-        elif worst == row.max_ulp and row.max_ulp > 0:
-            # `0 == 0` is an exact-by-construction op doing what it claims, enrolled so
-            # that any drift fails; reporting it as "no headroom" buried the real ones.
-            tight.append(_headroom_line(cell, worst, row.max_ulp, "no headroom"))
-        elif row.max_ulp >= _SLACK_MIN_BUDGET and worst < _SLACK_FRACTION * row.max_ulp:
-            slack.append(_headroom_line(cell, worst, row.max_ulp, "could tighten"))
+        elif worst < row.max_ulp:
+            # The figure is the measurement, so a better reading is a row a re-emit
+            # tightens; nothing in between, since a gate equal to its reading is the
+            # rule, not news.
+            better.append(_headroom_line(cell, worst, row.max_ulp, "re-emit tightens"))
 
     failed = [
         f"| `{f.test}` | {f.message.replace('|', '&#124;')} |"
@@ -981,11 +972,10 @@ def render_headroom(
             "last measured",
             False,
         ),
-        ("No headroom left", tight, "budget", True),
         (
-            f"Carrying slack (measured under {_SLACK_FRACTION:.0%} of budget)",
-            slack,
-            "budget",
+            "Measured better than the row's figure (a re-emit tightens these)",
+            better,
+            "figure",
             True,
         ),
     )
@@ -1020,10 +1010,10 @@ def render_headroom(
             *_md_table(("cell (op, in, out, approx, dest_acc)",), lines),
             "",
         ]
-    if not (over or regressed or tight or slack or failed or unrecorded):
+    if not (over or regressed or better or failed or unrecorded):
         out += [
-            "Every gated cell is inside its budget with headroom to spare, and no "
-            "judged tolerance cell is past its recorded measurement.",
+            "Every gated cell measures exactly its figure, and no judged tolerance cell "
+            "is past its recorded measurement.",
             "",
         ]
     return "\n".join(out), len(over) + len(regressed) + len(failed) + len(unrecorded)

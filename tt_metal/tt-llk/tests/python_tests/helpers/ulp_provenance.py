@@ -4,9 +4,9 @@
 """The SFPU accuracy table as rows, and each row's provenance as fields.
 
 Every row of ``sfpu_accuracy_budget.yaml`` that carries a budget says which measurement
-it came from in fields of its own -- ``measured``, ``measured_all``, ``nonfinite``, and
-``run`` or ``sampled`` -- which PyYAML loads and the registry loader validates like any
-other field. The comment beside a row is prose for people; no code reads it.
+it came from in fields of its own -- ``measured``, ``nonfinite``, and ``run`` or
+``sampled`` -- which PyYAML loads and the registry loader validates like any other
+field. On a ULP row ``measured`` is the gate itself: there is no second number. The comment beside a row is prose for people; no code reads it.
 :class:`Provenance` is the typed view of the fields, and :class:`BudgetTable` is the one
 walk over the file, locating rows through PyYAML's own event stream rather than by the
 shape of a line.
@@ -134,21 +134,20 @@ def load_yaml(text: str, where: str) -> Any:
 class Provenance:
     """The measurement behind a row, as the row's own fields.
 
-    * ``measured`` -- the worst lane the budget was derived from: over every ranked
-      lane, or for a row with a ``near_zero_atol`` floor, over the lanes outside it. On a
-      row the sweep could not measure, the worst of the lanes it could.
-    * ``measured_all`` -- a floored row's worst lane over every lane, floor included.
+    * ``measured`` -- the worst lane, in steps: over every ranked lane, or for a row with
+      a ``near_zero_atol`` floor, over the lanes outside it. On a ULP row it is the gate;
+      there is no headroom over it. On a row the sweep could not measure, the worst of
+      the lanes it could.
     * ``nonfinite`` -- lanes disagreeing with the golden about being finite, which hold
       the row's cell on tolerance; the headroom report fails a run in which it grows.
     * ``run`` -- the day the sweep measured the row, on ``MEASURED_ARCH`` (or the row's
       own ``arch``): every value of a 16-bit input, a stride of a Float32 one.
-    * ``sampled`` -- the day a functional driver's sample measured it instead. A sample
-      cannot assert what the sweep can: a swept row carries exactly the emitter's
-      budget, a sampled one may sit above its figure.
+    * ``sampled`` -- the day a functional driver's sample measured it instead. The
+      drivers seed their stimuli, so the figure is reproducible and gates like the
+      sweep's.
     """
 
     measured: Optional[int] = None
-    measured_all: Optional[int] = None
     nonfinite: Optional[int] = None
     run: Optional[date] = None
     sampled: Optional[date] = None
@@ -190,7 +189,7 @@ class Provenance:
         """What is wrong with these fields on their own, as messages; ``[]`` if
         nothing. Combinations with the contract are the loader's to check."""
         found = []
-        for name, least in (("measured", 0), ("measured_all", 0), ("nonfinite", 1)):
+        for name, least in (("measured", 0), ("nonfinite", 1)):
             value = getattr(self, name)
             if value is not None and not (_is_int(value) and value >= least):
                 found.append(f"`{name}` must be an integer >= {least}, got {value!r}")
@@ -210,13 +209,6 @@ class Provenance:
                 found.append(f"`{name}` needs the `run` or `sampled` date it came from")
         if self.sampled is not None and self.measured is None:
             found.append("`sampled` without the `measured` figure it records")
-        if self.measured_all is not None and (
-            self.measured is None or self.measured_all < self.measured
-        ):
-            found.append(
-                "`measured_all` is the worst lane over every lane, so it needs "
-                "`measured` and cannot be below it"
-            )
         return found
 
 
@@ -227,27 +219,21 @@ PROVENANCE_FIELDS = tuple(f.name for f in fields(Provenance))
 
 def check_provenance(where: str, row: Dict[str, Any], *, tolerance: bool) -> None:
     """A row's provenance fields, against themselves and its contract; *tolerance* is
-    whether the row's resolved metric is the tolerance one. The figure a budget came
-    from is part of the row: a step budget without one is a guess, and the table's rule
-    is that no number in it is. The registry's loader and the PR guard both call this,
-    so the two cannot disagree about provenance."""
+    whether the row's resolved metric is the tolerance one. A ULP row's gate *is* its
+    ``measured`` figure, so a ULP row without one is a guess, and the table's rule is
+    that no number in it is. The registry's loader and the PR guard both call this, so
+    the two cannot disagree about provenance."""
     provenance = Provenance.of(row)
     problems = provenance.problems()
-    if not tolerance and "max_ulp" in row and provenance.measured is None:
+    if not tolerance and provenance.measured is None:
         problems.append(
-            "a `max_ulp` row needs the `measured` figure it came from, and the `run` or "
-            "`sampled` date it was measured on"
+            "a ulp row's gate is its `measured` figure, with the `run` or `sampled` "
+            "date it was measured on; the row has neither"
         )
     if provenance.nonfinite is not None and not tolerance:
         problems.append(
             "`nonfinite` lanes hold a cell on tolerance, so it belongs on a "
             "`metric: tolerance` row"
-        )
-    # `near_zero_atol: null` is the contract's "no floor", the same as no field.
-    if provenance.measured_all is not None and row.get("near_zero_atol") is None:
-        problems.append(
-            "`measured_all` is the worst lane a `near_zero_atol` floor rescues; the "
-            "row has no floor"
         )
     if problems:
         raise ValueError(f"{where} {row}: " + "; ".join(problems))
@@ -316,9 +302,10 @@ class Row:
 
     @property
     def max_ulp(self) -> Optional[int]:
-        """The step budget, or ``None`` on the tolerance metric."""
-        value = self.values.get("max_ulp")
-        if self.metric == "tolerance" or not isinstance(value, int):
+        """The step budget -- the row's ``measured`` figure, which is the gate -- or
+        ``None`` on the tolerance metric."""
+        value = self.values.get("measured")
+        if self.metric == "tolerance" or not _is_int(value):
             return None
         return value
 

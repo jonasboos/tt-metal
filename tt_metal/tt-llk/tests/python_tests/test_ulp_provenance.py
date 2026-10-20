@@ -4,10 +4,10 @@
 """Host-side guards for ``helpers/ulp_provenance.py``: the budget table read as rows,
 and each row's provenance as fields of its own.
 
-No verdict depends on a row's comment: the provenance is ``measured``,
-``measured_all``, ``nonfinite`` and ``run`` / ``sampled``, which PyYAML loads and the
-registry loader validates. Where a comment is asserted, it is to check that the prose
-is read back as written.
+No verdict depends on a row's comment: the provenance is ``measured``, ``nonfinite``
+and ``run`` / ``sampled``, which PyYAML loads and the registry loader validates; on a
+ULP row ``measured`` is the gate. Where a comment is asserted, it is to check that the
+prose is read back as written.
 """
 
 from dataclasses import fields
@@ -31,7 +31,6 @@ _DAY = date(2026, 10, 5)
     [
         Provenance(measured=5, run=_DAY),
         Provenance(measured=0, sampled=_DAY),
-        Provenance(measured=2, measured_all=14337, run=_DAY),
         Provenance(measured=393, nonfinite=6, run=_DAY),
         Provenance(nonfinite=3, run=_DAY),
         Provenance(run=_DAY),
@@ -42,7 +41,7 @@ _DAY = date(2026, 10, 5)
 def test_a_written_row_reads_back_as_the_provenance_it_was_written_with(provenance):
     """``render_row`` writes a date unquoted, so PyYAML reads it back as a date and not
     a string the loader would refuse."""
-    fields = {"in": "Float16", "out": "Float16", "max_ulp": 6, **provenance.as_fields()}
+    fields = {"in": "Float16", "out": "Float16", **provenance.as_fields()}
     (row,) = BudgetTable("Gelu:\n" + render_row(fields, "prose")).rows
     assert row.provenance == provenance
     assert row.comment == "prose"
@@ -62,8 +61,6 @@ def test_a_written_row_reads_back_as_the_provenance_it_was_written_with(provenan
         # An unquoted `2026-10-05 12:00:00` loads as a datetime, which is a date too.
         (dict(measured=1, run=datetime(2026, 10, 5, 12, 0)), "must be a date"),
         (dict(sampled=_DAY), "without the `measured` figure"),
-        (dict(measured_all=3, run=_DAY), "needs `measured`"),
-        (dict(measured=5, measured_all=3, run=_DAY), "cannot be below it"),
     ],
     ids=[
         "no-date",
@@ -75,8 +72,6 @@ def test_a_written_row_reads_back_as_the_provenance_it_was_written_with(provenan
         "string-date",
         "datetime",
         "sampled-alone",
-        "measured-all-alone",
-        "measured-all-below",
     ],
 )
 def test_a_malformed_provenance_says_what_is_wrong(fields, problem):
@@ -99,14 +94,14 @@ def test_an_alias_row_a_yaml_boolean_and_a_date_read_as_the_loader_reads_them():
         "  - &lut {metric: tolerance, atol: 0.13}  # the anchor\n"
         "Gelu:\n"
         "  - *lut  # through the alias\n"
-        "  - {in: Float16, out: Float16, dest: Yes, max_ulp: 2, measured: 1, "
+        "  - {in: Float16, out: Float16, dest: Yes, measured: 2, "
         "run: 2026-10-05}\n"
     )
     alias, keyed = table.rows_of("Gelu")
     assert alias.alias and alias.values["atol"] == 0.13
     assert alias.comment == "through the alias"
     assert keyed.pinned["dest"] == "Yes"
-    assert keyed.provenance == Provenance(measured=1, run=_DAY)
+    assert keyed.provenance == Provenance(measured=2, run=_DAY)
 
 
 def test_an_op_whose_whole_row_list_is_an_alias_has_the_anchors_rows():
@@ -114,7 +109,7 @@ def test_an_op_whose_whole_row_list_is_an_alias_has_the_anchors_rows():
     registry enforces. Each is an alias row, located on the key line."""
     table = BudgetTable(
         "Abs: &low\n"
-        "  - {out: Float16_b, max_ulp: 2, measured: 2, run: 2026-10-05}\n"
+        "  - {out: Float16_b, measured: 2, run: 2026-10-05}\n"
         "  - {out: Float32, metric: tolerance}\n"
         "Neg: *low\n"
     )
@@ -124,7 +119,7 @@ def test_an_op_whose_whole_row_list_is_an_alias_has_the_anchors_rows():
 
 
 def test_a_row_is_found_by_exactly_its_key():
-    table = BudgetTable("Abs:\n  - {in: Float16_b, out: Float16_b, max_ulp: 0}\n")
+    table = BudgetTable("Abs:\n  - {in: Float16_b, out: Float16_b, measured: 0}\n")
     assert table.row("Abs", in_="Float16_b", out="Float16_b").max_ulp == 0
     with pytest.raises(LookupError):  # allow-pytest.raises: host-only test
         table.row("Abs", out="Float16_b")
@@ -210,8 +205,7 @@ def test_the_provenance_fields_are_the_loaders(tmp_path):
     path = tmp_path / "budget.yaml"
     path.write_text(
         "Abs:\n"
-        "  - {out: Float16_b, max_ulp: 2, near_zero_atol: 1.0e-3, measured: 1,"
-        " measured_all: 9, run: 2026-10-05}\n"
+        "  - {out: Float16_b, near_zero_atol: 1.0e-3, measured: 2, run: 2026-10-05}\n"
         "  - {out: Float16, metric: tolerance, measured: 3, nonfinite: 2,"
         " sampled: 2026-10-05}\n",
         encoding="utf-8",
@@ -224,18 +218,17 @@ def test_a_block_style_row_reads_its_own_fields_not_the_next_rows():
         "Abs:\n"
         "  - in: Float16\n"
         "    out: Float16\n"
-        "    max_ulp: 1\n"
         "    measured: 1\n"
         "    run: 2026-01-01\n"
-        "  - {in: Float32, out: Float32, max_ulp: 2, measured: 2, run: 2026-01-01}\n"
+        "  - {in: Float32, out: Float32, measured: 2, run: 2026-01-01}\n"
     )
     first, second = table.rows_of("Abs")
-    assert first.last_line == 5 and first.provenance.measured == 1
+    assert first.last_line == 4 and first.provenance.measured == 1
     assert second.provenance.measured == 2
 
 
 def test_an_arch_is_keyed_by_its_enum_name_whichever_way_it_is_spelt():
-    table = BudgetTable("Abs:\n  - {in: Float16_b, arch: wormhole, max_ulp: 1}\n")
+    table = BudgetTable("Abs:\n  - {in: Float16_b, arch: wormhole, measured: 1}\n")
     (row,) = table.rows_of("Abs")
     assert dict(row.key)["arch"] == "WORMHOLE"
 
@@ -244,10 +237,10 @@ def test_an_arch_is_keyed_by_its_enum_name_whichever_way_it_is_spelt():
     "text, match",
     [
         (
-            "Abs:\n  - {max_ulp: 0}\nAbs:\n  - {max_ulp: 1}\n",
+            "Abs:\n  - {measured: 0}\nAbs:\n  - {measured: 1}\n",
             "line 3: duplicate entry for 'Abs'",
         ),
-        ("Abs:\n  - {out: Float16_b, out: Float32, max_ulp: 1}\n", "for 'out'"),
+        ("Abs:\n  - {out: Float16_b, out: Float32, measured: 1}\n", "for 'out'"),
     ],
 )
 def test_the_table_refuses_a_repeated_key_as_the_registry_does(text, match):
@@ -272,18 +265,18 @@ def test_a_borrowed_measurement_is_refused_with_its_line():
     ):
         BudgetTable(
             "Abs:\n"
-            "  - &b {out: Float16_b, max_ulp: 2, measured: 2, run: 2026-10-05}\n"
+            "  - &b {out: Float16_b, measured: 2, run: 2026-10-05}\n"
             "Neg:\n"
-            "  - {<<: *b, out: Float32, max_ulp: 5}\n"
+            "  - {<<: *b, out: Float32}\n"
         )
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "<<: {Abs: [{out: Float16_b, max_ulp: 2, measured: 2, run: 2026-10-05}]}\n",
+        "<<: {Abs: [{out: Float16_b, measured: 2, run: 2026-10-05}]}\n",
         "x: &x {measured: 2, run: 2026-10-05}\n"
-        "<<: {Abs: [{<<: *x, out: Float16, max_ulp: 2}]}\n",
+        "<<: {Abs: [{<<: *x, out: Float16, measured: 2}]}\n",
     ],
     ids=["op-through-a-root-merge", "borrowed-inside-a-root-merge"],
 )
@@ -305,5 +298,5 @@ def test_an_op_the_walk_cannot_place_is_refused():
         ValueError, match=r"cannot locate op\(s\) \['True'\]"
     ):
         BudgetTable(
-            "true:\n  - {out: Float16_b, max_ulp: 2, measured: 2, run: 2026-10-05}\n"
+            "true:\n  - {out: Float16_b, measured: 2, run: 2026-10-05}\n"
         )

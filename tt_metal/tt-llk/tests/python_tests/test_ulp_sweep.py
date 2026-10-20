@@ -26,7 +26,6 @@ from helpers.llk_params import ApproximationMode, DestAccumulation, MathOperatio
 from helpers.ulp import has_ulp_gate
 from helpers.ulp_provenance import BudgetTable, Provenance
 from helpers.ulp_sweep import (
-    EMIT_HEADROOM,
     MEASURED,
     AmbiguousCollapse,
     IncompleteGrid,
@@ -62,9 +61,9 @@ _WORST, _FLOOR = 14337, (2, 2.4e-7)
 
 #: One op block with a row of each kind write_table has to tell apart.
 _TABLE = """Gelu:  # header provenance, ungeneratable
-  - {in: Float16, out: Float16, max_ulp: 7, measured: 6, run: 2026-09-01}  # superseded
-  - {in: Float16_b, out: Float32, max_ulp: 9, measured: 9, sampled: 2026-09-18}  # fp32 output, not swept
-  - {in: Float16_b, out: Float16_b, arch: BLACKHOLE, max_ulp: 44, measured: 40, sampled: 2026-09-18}  # another arch
+  - {in: Float16, out: Float16, measured: 7, run: 2026-09-01}  # superseded
+  - {in: Float16_b, out: Float32, measured: 9, sampled: 2026-09-18}  # fp32 output, not swept
+  - {in: Float16_b, out: Float16_b, arch: BLACKHOLE, measured: 44, sampled: 2026-09-18}  # another arch
 
 Log1p:
   - {in: Float16, out: Float16_b, metric: tolerance}  # hand-authored non-enrolment
@@ -127,7 +126,7 @@ def test_only_the_cells_this_run_measured_are_replaced(table):
 
     after = BudgetTable.load(table)
     gelu = after.row("Gelu", in_="Float16", out="Float16")
-    assert gelu.max_ulp == 6  # 5 * 1.1, rounded up; the superseded 7 is gone
+    assert gelu.max_ulp == 5  # the measurement is the gate; the superseded 7 is gone
     assert gelu.provenance == Provenance(measured=5, run=_RUN)
     assert after.blocks["Gelu"].header == "header provenance, ungeneratable"
     # The same op's other (in, out) cell and the other arch's row: kept as they were.
@@ -167,7 +166,7 @@ def test_a_row_a_narrower_re_emit_did_not_supersede_keeps_its_own_run(table):
     row stays as it was."""
     table.write_text(
         "Gelu:  # 0 ULP, 16 variants, 2026-09-18\n"
-        "  - {out: Float32, max_ulp: 0, measured: 0, sampled: 2026-09-18}\n",
+        "  - {out: Float32, measured: 0, sampled: 2026-09-18}\n",
         encoding="utf-8",
     )
     bare = BudgetTable.load(table).row("Gelu", out="Float32")
@@ -193,11 +192,11 @@ def test_a_re_emit_leaves_a_hand_written_row_and_an_arch_row_alone(table):
     the sweep made the provenance audit read a sample as exhaustive."""
     table.write_text(
         "Gelu:\n"
-        "  - {in: Float16_b, out: Float32, max_ulp: 9, measured: 9, sampled: 2026-09-18}"
+        "  - {in: Float16_b, out: Float32, measured: 9, sampled: 2026-09-18}"
         "  # fp32 output, not swept\n"
         "  - {out: Float16, metric: tolerance, measured: 384, sampled: 2026-09-18}"
         "  # 40 variants / 737k lanes\n"
-        "  - {in: Float16_b, out: Float16_b, arch: BLACKHOLE, max_ulp: 44}  # bh\n",
+        "  - {in: Float16_b, out: Float16_b, arch: BLACKHOLE, measured: 44}  # bh\n",
         encoding="utf-8",
     )
     before = BudgetTable.load(table)
@@ -228,7 +227,7 @@ def test_a_demotion_records_the_measurement_past_the_ceiling(table):
     note handed back as the budget."""
     from helpers.ulp_sweep import _verdict
 
-    assert _verdict(100, "Float16_b") == ("tolerance", 110)
+    assert _verdict(100, "Float16_b") == ("tolerance", 100)
     _record_grid("Gelu", "Float16_b", "Float16_b", 100)
     _record_grid("Gelu", "Float16_b", "Bfp8_b", 3)
     write_table(table, _RUN)
@@ -243,20 +242,6 @@ def test_a_demotion_records_the_measurement_past_the_ceiling(table):
         "tolerance",
         Provenance(measured=3, run=_RUN),
     )
-
-
-def test_a_strided_zero_is_floored_to_one_and_an_exhaustive_one_is_not():
-    """The sweep enumerates every 16-bit value, so a 0 there is the op being exactly
-    rounded. The Float32 walk visits 65,280 of 2**32, and a finite sample cannot assert
-    exactness: Rsqrt's Float32 -> Float32 cell had been written as 0 from it."""
-    from helpers.ulp_sweep import _verdict
-
-    assert _verdict(0, "Float32", "Float16_b") == ("ulp", 0)
-    assert _verdict(0, "Float32", "Float32") == ("ulp", 1)
-    assert _verdict(0, "Float16_b", "Float32") == ("ulp", 1)
-    assert _verdict(3, "Float32", "Float32") == ("ulp", 4)  # only the zero moves
-    # An exact op's 0 is its construction's, not the sample's.
-    assert _verdict(0, "Float32", "Float32", exact=True) == ("ulp", 0)
 
 
 def test_a_row_for_another_architecture_survives_a_regeneration(table):
@@ -279,7 +264,7 @@ def test_a_row_carrying_a_floor_is_regenerated_from_the_measurement(table):
     block was how Erfinv and Gelu stayed on a hand-set floor through every emit."""
     table.write_text(
         "Gelu:\n"
-        "  - {in: Float16, out: Float16, max_ulp: 2, near_zero_atol: 5.59e-07}  # floor\n",
+        "  - {in: Float16, out: Float16, near_zero_atol: 5.59e-07, measured: 2}  # floor\n",
         encoding="utf-8",
     )
     _record_grid("Gelu", "Float16", "Float16", 5)
@@ -288,7 +273,7 @@ def test_a_row_carrying_a_floor_is_regenerated_from_the_measurement(table):
     (row,) = report.written["Gelu"]
     assert (row.key, row.max_ulp, row.near_zero_atol) == (
         (("in", "Float16"), ("out", "Float16")),
-        6,
+        5,
         None,
     )
 
@@ -299,7 +284,7 @@ def test_an_op_whose_whole_row_list_is_an_alias_is_kept_verbatim(table):
     block is kept and the report says why."""
     table.write_text(
         "Abs: &low\n"
-        "  - {in: Float16, out: Float16, max_ulp: 7, measured: 6, run: 2026-09-01}\n"
+        "  - {in: Float16, out: Float16, measured: 7, run: 2026-09-01}\n"
         "\n"
         "Gelu: *low  # the same kernel path\n",
         encoding="utf-8",
@@ -319,10 +304,10 @@ def test_a_column_0_note_between_an_ops_rows_is_kept_once_and_moves_no_row(table
 
     table.write_text(
         "Gelu:\n"
-        "  - {in: Float16, out: Float16, max_ulp: 7, measured: 6, run: 2026-09-01}\n"
+        "  - {in: Float16, out: Float16, measured: 7, run: 2026-09-01}\n"
         "# a note someone left between two rows\n"
-        "  - {in: Float16_b, out: Float32, max_ulp: 9, measured: 9, sampled: 2026-09-18}\n"
-        "  - {in: Float16_b, out: Float16_b, max_ulp: 7, measured: 6, run: 2026-09-01}\n"
+        "  - {in: Float16_b, out: Float32, measured: 9, sampled: 2026-09-18}\n"
+        "  - {in: Float16_b, out: Float16_b, measured: 7, run: 2026-09-01}\n"
         "\n"
         "Log1p:\n"
         "  - {in: Float16, out: Float16_b, metric: tolerance}\n",
@@ -335,7 +320,7 @@ def test_a_column_0_note_between_an_ops_rows_is_kept_once_and_moves_no_row(table
     assert text.count("# a note someone left between two rows\n") == 1
     assert text.count("sampled: 2026-09-18") == 1
     after = BudgetTable.load(table)
-    assert after.row("Gelu", in_="Float16_b", out="Float16_b").max_ulp == 2
+    assert after.row("Gelu", in_="Float16_b", out="Float16_b").max_ulp == 1
     assert [r.op for r in after.rows].count("Gelu") == 3
     assert len(_load_table(table)[MathOperation.Gelu]) == 3
 
@@ -401,7 +386,7 @@ def test_a_measurement_with_nowhere_to_go_is_refused_after_writing_the_rest(tabl
     message = str(caught.value)
     assert message.startswith("rewrote 1 op block(s) in budget.yaml; but measured Sqrt")
     assert (
-        BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16").max_ulp == 6
+        BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16").max_ulp == 5
     )
 
 
@@ -433,29 +418,21 @@ def test_an_incomplete_grid_is_refused_rather_than_collapsed(table):
     assert table.read_text() == before
 
 
-def test_the_emitted_budget_uses_the_declared_headroom(monkeypatch):
-    """The factor was hardcoded beside the constant, so tuning it did nothing. The exact
-    figures pin the arithmetic; the retune is what ties `_verdict` to the constant, which
-    the literals alone do not -- a `_verdict` hard-coding 11/10 passes them."""
-    from helpers import ulp_sweep
+def test_the_emitted_figure_is_the_measurement():
+    """No headroom and no cap: the measurement is the gate while it fits the output's
+    ceiling, and past the ceiling the cell is on tolerance with the same figure. A block
+    float never enrols from a sorted sweep, however small the reading."""
     from helpers.ulp_sweep import _verdict
 
-    assert _verdict(100, "Float32") == ("ulp", 110)  # exactly 1.1x, not float-rounded
-    assert _verdict(10, "Float32") == ("ulp", 11)
-    assert EMIT_HEADROOM == 1.1  # the figures here are written against it
-    # A measurement that fits the ceiling enrols even when the headroom would not:
-    # capped at the ceiling, with zero slack. One past it stays on tolerance.
-    assert _verdict(5, "Float16_b") == ("ulp", 6)  # 1.1x of 5 is 5.5, within the 6
-    assert _verdict(6, "Float16_b") == ("ulp", 6)  # measured at the ceiling: zero slack
-    assert _verdict(7, "Float16_b") == ("tolerance", 8)
-    assert _verdict(393216, "Float32") == ("ulp", 419430)
-    # Zero is exact and stays exact: the sweep saw every value.
+    assert _verdict(100, "Float32") == ("ulp", 100)
     assert _verdict(0, "Float32") == ("ulp", 0)
-    # A block float never enrols from a sorted sweep, however small the reading.
+    assert _verdict(5, "Float16_b") == ("ulp", 5)
+    assert _verdict(6, "Float16_b") == ("ulp", 6)  # at the ceiling: still a gate
+    assert _verdict(7, "Float16_b") == ("tolerance", 7)
+    assert _verdict(419430, "Float32") == ("ulp", 419430)
+    assert _verdict(419431, "Float32") == ("tolerance", 419431)
     assert _verdict(3, "Bfp8_b") == ("block", 3)
     assert _verdict(0, "Bfp8_b") == ("block", 0)
-    monkeypatch.setattr(ulp_sweep, "EMIT_HEADROOM", 1.5)
-    assert _verdict(10, "Float32") == ("ulp", 15)
 
 
 def test_a_nonfinite_disagreement_is_reported_rather_than_only_masked_out():
@@ -1324,7 +1301,7 @@ def test_emit_writes_on_a_clean_wormhole_session(table):
     (row,) = [r for r in report.written["Gelu"] if r.provenance.run == date.today()]
     assert (row.key, row.max_ulp, row.provenance.measured) == (
         (("in", "Float16"), ("out", "Float16")),
-        6,
+        5,
         5,
     )
 
@@ -1490,7 +1467,7 @@ def test_an_unmeasurable_cell_is_written_as_its_own_verdict(table):
     )
     write_table(table, _RUN)
     after = BudgetTable.load(table)
-    assert after.row("Gelu", in_="Float16", out="Float16", approx="No").max_ulp == 6
+    assert after.row("Gelu", in_="Float16", out="Float16", approx="No").max_ulp == 5
     parked = after.row("Gelu", in_="Float16", out="Float16", approx="Yes")
     assert (parked.metric, parked.provenance) == ("tolerance", Provenance(run=_RUN))
     assert parked.provenance.unmeasurable
@@ -1520,7 +1497,7 @@ def test_an_op_with_an_unregenerable_row_is_kept_while_the_rest_are_written(tmp_
         "  - {in: Float16, out: Float16, metric: tolerance, atol: 0.2}  # hand atol\n"
         "\n"
         "Gelu:\n"
-        "  - {in: Float16, out: Float16, max_ulp: 7}  # superseded\n",
+        "  - {in: Float16, out: Float16, measured: 7}  # superseded\n",
         encoding="utf-8",
     )
     MEASURED.clear()
@@ -1532,7 +1509,7 @@ def test_an_op_with_an_unregenerable_row_is_kept_while_the_rest_are_written(tmp_
     after = BudgetTable.load(path)
     erfinv = after.row("Erfinv", in_="Float16", out="Float16")
     assert (erfinv.values["atol"], erfinv.comment) == (0.2, "hand atol")
-    assert [row.max_ulp for row in after.rows_of("Gelu")] == [6]
+    assert [row.max_ulp for row in after.rows_of("Gelu")] == [5]
 
 
 def test_a_rewritten_block_keeps_one_blank_line_before_the_next(table):
@@ -1656,9 +1633,9 @@ def test_an_answer_the_dest_did_not_saturate_to_stays_judged():
 
 
 def test_the_near_zero_floor_is_derived_from_the_band_and_capped():
-    """A cell demoted only by near-zero lanes gets the floor that covers them -- the
-    band's largest absolute error with headroom, two figures -- and the budget of the
-    lanes outside it. A cell that fits gets none; one whose band error is past the cap
+    """A cell demoted only by near-zero lanes gets the floor that covers them -- exactly
+    the band's largest absolute error, no margin -- and the budget of the lanes outside
+    it. A cell that fits gets none; one whose band error is past the cap
     stays demoted; a lane outside the band (|golden| >= 1% of the cell's maximum) is
     never rescued."""
     from helpers.ulp_sweep import EMIT_MAX_NEAR_ZERO_ATOL, near_zero_floor
@@ -1680,9 +1657,8 @@ def test_the_near_zero_floor_is_derived_from_the_band_and_capped():
 
     residual, atol = floor(result)
     assert residual == 1
-    assert atol == pytest.approx(
-        1.1e-6, rel=1e-6
-    )  # 9.98e-7 (bf16's 1e-6) x 1.1, rounded up
+    # Exactly the band's largest absolute error: bf16's 1e-6, flushed to 0.
+    assert atol == float(torch.tensor(1e-6, dtype=torch.bfloat16))
 
     fits = golden.clone()
     fits[1] = 1.5078125
@@ -1702,23 +1678,22 @@ def test_the_near_zero_floor_is_derived_from_the_band_and_capped():
 
 
 def test_a_floored_cell_is_written_with_its_floor_and_read_back(table):
-    """The row carries `max_ulp` for the lanes outside the floor and `near_zero_atol`
-    for the floor; `measured` is the residual, the figure the provenance audit and the
-    headroom report compare against, and `measured_all` the unfloored maximum. The
-    loader accepts the row as a ULP contract with a floor."""
+    """The row carries `measured`, the worst lane outside the floor, which is its gate,
+    and `near_zero_atol` for the floor, written exactly. The loader accepts the row as
+    a ULP contract with a floor."""
     from helpers.sfpu_accuracy_budget import _load_table
 
     _record_grid("Gelu", "Float16", "Float16", _WORST, floor=_FLOOR)
     report = write_table(table, _RUN)
     assert (set(report.written), report.kept) == ({"Gelu"}, {})
     row = BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16")
-    assert (row.max_ulp, row.near_zero_atol) == (3, 2.4e-7)
-    assert row.provenance == Provenance(measured=2, measured_all=14337, run=_RUN)
+    assert (row.max_ulp, row.near_zero_atol) == (2, 2.4e-7)
+    assert row.provenance == Provenance(measured=2, run=_RUN)
     contracts = _load_table(table)[MathOperation.Gelu]
     (contract,) = [
         c for k, c in contracts.items() if k.input_format is DataFormat.Float16
     ]
-    assert (contract.max_ulp, contract.near_zero_atol) == (3, 2.4e-7)
+    assert (contract.max_ulp, contract.near_zero_atol) == (2, 2.4e-7)
 
 
 def test_a_32bit_or_bf16_dest_holds_every_answer_the_output_can():
@@ -1856,7 +1831,7 @@ def test_an_anchored_key_line_keeps_its_anchor_when_its_op_is_emitted(table):
 
     table.write_text(
         "Abs: &low  # shared with Neg\n"
-        "  - {in: Float16, out: Float16, max_ulp: 7, measured: 6, run: 2026-09-01}\n"
+        "  - {in: Float16, out: Float16, measured: 7, run: 2026-09-01}\n"
         "\n"
         "Neg: *low\n",
         encoding="utf-8",
@@ -1868,7 +1843,7 @@ def test_an_anchored_key_line_keeps_its_anchor_when_its_op_is_emitted(table):
     )
     loaded = _load_table(table)
     assert loaded[MathOperation.Neg] == loaded[MathOperation.Abs]
-    assert BudgetTable.load(table).rows_of("Neg")[0].max_ulp == 3
+    assert BudgetTable.load(table).rows_of("Neg")[0].max_ulp == 2
 
 
 def test_a_rewrite_that_would_not_load_leaves_the_table_as_it_was(table):
@@ -1877,7 +1852,7 @@ def test_a_rewrite_that_would_not_load_leaves_the_table_as_it_was(table):
     one no LLK test could import; it is now loaded before it is written."""
     text = (
         "Abs:\n"
-        "  - &base {in: Float16, out: Float16, max_ulp: 7, measured: 6, run: 2026-09-01}\n"
+        "  - &base {in: Float16, out: Float16, measured: 7, run: 2026-09-01}\n"
         "\n"
         "Neg:\n"
         "  - *base\n"
@@ -1956,5 +1931,5 @@ def test_the_plugin_prints_the_emit_summary_on_a_clean_session(
     assert out == "--ulp-emit: rewrote 1 op block(s) in budget.yaml\n"
     assert session.exitstatus == pytest.ExitCode.OK
     assert (
-        BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16").max_ulp == 6
+        BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16").max_ulp == 5
     )

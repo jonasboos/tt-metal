@@ -177,8 +177,8 @@ or the sweep has nothing to feed it.
 
 The emitter keeps an op's key line -- its name and any header comment -- as it is; it
 never writes a key line itself. So a *new* op needs one by hand first. Add the name and
-one placeholder row (a key with no rows fails to load, and so does a `max_ulp` row
-without the `measured` figure it came from):
+one placeholder row (a key with no rows fails to load, and so does a ULP row without
+the `measured` figure that is its gate):
 
 ```yaml
 MyOp:
@@ -200,33 +200,32 @@ writes nothing.
 
 ```yaml
 MyOp:
-  - {in: Float16_b, out: Float16_b, max_ulp: 2, measured: 1, run: 2026-09-23}
+  - {in: Float16_b, out: Float16_b, measured: 1, run: 2026-09-23}
   - {in: Float16, out: Float16_b, metric: tolerance, measured: 14337, run: 2026-09-23}
   - {in: Float16_b, out: Bfp8_b, metric: tolerance, measured: 393, run: 2026-09-23}
 ```
 
-Every row says what it was derived from: `measured`, the worst lane, and `run`, the
-day the sweep measured it (a functional driver's hand-measured row says `sampled:`
-instead). Those fields are the provenance; the comment is for people. Five verdicts:
+Every row records `measured`, the worst lane, and `run`, the day the sweep measured it
+(a functional driver's row says `sampled:` instead). On a ULP row `measured` *is* the
+gate: there is no headroom over it. The comment is for people. Five verdicts:
 
-- **`max_ulp: N`** — enrolled. `N` is the measurement plus 1.1x headroom, capped at the
-  output's usable ceiling when the measurement itself fits under it. A measured 0 stays
-  0 on a 16-bit input the sweep enumerates, and on an op exact by construction; on the
-  strided `Float32` input it is written as 1, since a sample cannot assert exactness.
-- **`max_ulp: N, near_zero_atol: A, measured: R, measured_all: M`** — enrolled with a
-  floor: `R` is the worst lane outside it, `M` the worst over every lane. The step count is a difference of
-  bit-pattern ranks, so a lane where the hardware answers 0 for a 2e-9 the golden still
-  holds reads as 2^29 fp32 steps, and one such lane demoted the whole cell. Lanes under
-  1 % of the cell's largest golden (and under `A/0.01`) are judged on absolute error
-  instead; `A` is the smallest floor that rescues the band lanes past the ceiling, with
-  1.1x headroom, and `N` is the budget of everything outside it. The emitter grants a
-  floor up to `ulp_sweep.EMIT_MAX_NEAR_ZERO_ATOL` (1e-3); a cell that would need more
-  is demoted, and its comment says what the floor would have left.
+- **`measured: N`**, no `metric` — enrolled. The sweep holds the cell to exactly `N`
+  steps: a reading one step worse fails it, and a re-emit that records the worse figure
+  is a raised gate the PR guard reports. A measured 0 stays 0, on the strided `Float32`
+  input too: the stride is a fixed set of values, and the figure is a measurement of it.
+- **`measured: R, near_zero_atol: A`** — enrolled with a floor: `R` is the worst lane
+  outside it. The step count is a difference of bit-pattern ranks, so a lane where the
+  hardware answers 0 for a 2e-9 the golden still holds reads as 2^29 fp32 steps, and one
+  such lane demoted the whole cell. Lanes under 1 % of the cell's largest golden (and
+  under `A/0.01`) are judged on absolute error instead; `A` is exactly the largest
+  absolute error among the band lanes past the ceiling, written as measured, and `R`
+  gates everything outside it. The emitter grants a floor up to
+  `ulp_sweep.EMIT_MAX_NEAR_ZERO_ATOL` (1e-3); a cell that would need more is demoted,
+  and its comment says what the floor would have left.
 - **`metric: tolerance, measured: N`** on a step-gateable output — demoted: the
   measurement itself is past `usable_budget_ceiling`, so a step budget would no longer
   be *tighter* than the tolerance it replaces. The op keeps tolerance + PCC on that
-  cell, and `measured` is what the headroom report holds it to; the budget it would
-  have needed is `_verdict`'s for that figure.
+  cell, and `measured` is what the headroom report holds it to.
 - **`metric: tolerance, measured: N`** on a block-float output — block-quantized. The sweep
   enumerates a format in value order, so sixteen adjacent values share a `Bfp8_b` block
   and the exponent fits all of them: the best case for quantization, not a
@@ -256,12 +255,12 @@ pytest test_sfpu_accuracy_budget.py test_ulp_sweep.py test_ulp_provenance.py -q
 
 ## The rules the table enforces
 
-- **No number is a guess.** A row's `measured` and `run`/`sampled` fields are the
-  measurement it came from, and the loader refuses a `max_ulp` row without them. A
-  budget may only be *raised* by re-measuring and updating them in the same change. The
-  comment beside a row is prose; no code reads it. `python3 helpers/ulp_budget_diff.py
-  diff --base <old.yaml> --head <new.yaml>` lists every cell a change loosens and
-  whether its row was re-measured.
+- **No number is a guess, and the measurement is the number.** A ULP row's gate is its
+  `measured` figure, with the `run`/`sampled` date it came from; the loader refuses one
+  without them. There is no headroom: a worse measurement is a raised gate, recorded by
+  a re-emit in a change of its own. The comment beside a row is prose; no code reads it.
+  `python3 helpers/ulp_budget_diff.py diff --base <old.yaml> --head <new.yaml>` lists
+  every cell a change loosens and whether its date moved with it.
 - **Most specific key wins.** A row's key fields are `in`, `out`, `approx`, `dest` and
   `arch`, all optional. Two rows matching one variant equally specifically are an
   authoring error, not a tie-break, and the loader refuses them.
@@ -269,10 +268,9 @@ pytest test_sfpu_accuracy_budget.py test_ulp_sweep.py test_ulp_provenance.py -q
   measured with `FAST_MODE(No)` and `CLAMP_NEGATIVE(True)` compiled in, and the key has
   no axis for either. The unary functional driver builds `Sqrt`/`Rsqrt` at
   `FastMode.Yes` and takes only a row's tolerance arm, which those flags do not move.
-- **An exhaustive budget is the emitter's number.** `test_no_step_budget_exceeds_the_measurement_it_records`
-  holds every row the sweep wrote to exactly `_verdict`'s budget for the measurement
-  beside it, so widening one by hand has to falsify its `measured`. A sampled row may sit up
-  to 2x its measurement.
+- **A gate is a measurement, swept or sampled.** The drivers seed their stimuli, so a
+  sampled row's figure is reproducible and gates like the sweep's; neither carries an
+  envelope.
 - **A gated cell is not parked quietly.** A `not measurable` verdict on a gateable output
   has to be acknowledged in `_UNMEASURABLE_CELLS_ACKNOWLEDGED` with its cause, or the
   lanes behind it named in `_KNOWN_NONFINITE_LANES` with their issue.

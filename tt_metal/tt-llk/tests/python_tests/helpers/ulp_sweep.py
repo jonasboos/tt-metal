@@ -20,7 +20,6 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass, replace
 from datetime import date
-from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -1006,13 +1005,6 @@ MEASURED: Dict[
     str, Dict[Tuple[str, str, str, str], Union[int, "Floored", Unmeasurable]]
 ] = {}
 
-#: Headroom over the measured worst lane. A 16-bit input is swept exhaustively, so unlike a
-#: sampled measurement there is no unseen tail to leave room for -- but a budget at
-#: exactly the maximum fails on any movement at all, including a golden that gets more
-#: accurate. A strided Float32 input does leave a tail unseen; the headroom is the same,
-#: and only its 0 is treated as a sample (:func:`_verdict`).
-EMIT_HEADROOM = 1.1
-
 #: The widest ``near_zero_atol`` the emitter writes on its own. A cell whose only
 #: over-ceiling lanes sit in the near-zero band is enrolled with the floor that covers
 #: them (:func:`near_zero_floor`); past this the floor would be forgiving a kernel's
@@ -1033,21 +1025,6 @@ class Floored:
     atol: float
 
 
-#: Absorbs the float noise in ``x / scale``, so an *x* already on the grid (6.8e-05)
-#: is not bumped a grid step. It lets the result land a hair below *x*; the
-#: 1.1x headroom applied before rounding is what keeps a floor above its error.
-_ROUND_UP_SLACK = 1e-9
-
-
-def _round_up_sig(x: float, digits: int = 2) -> float:
-    """*x* rounded up to *digits* significant figures (see :data:`_ROUND_UP_SLACK`)."""
-    if x == 0:
-        return 0.0
-    exponent = math.floor(math.log10(x))
-    scale = 10.0 ** (exponent - digits + 1)
-    return math.ceil(x / scale - _ROUND_UP_SLACK) * scale
-
-
 def near_zero_floor(
     golden: torch.Tensor,
     result: torch.Tensor,
@@ -1056,7 +1033,9 @@ def near_zero_floor(
     out_fmt: DataFormat,
 ) -> Optional[Tuple[int, float]]:
     """``(residual, atol)``: the worst lane outside the near-zero floor a demoted cell
-    needs, and that floor; ``None`` when the cell fits without one (see SFPU_ULP.md)."""
+    needs, and that floor; ``None`` when the cell fits without one (see SFPU_ULP.md).
+    The floor is exactly the largest absolute error it rescues, no margin and no
+    rounding: like the step figure, it is the measurement."""
     from helpers.sfpu_accuracy_budget import usable_budget_ceiling
     from helpers.ulp import _ULP_PROXY_DTYPES, NEAR_ZERO_FRACTION
 
@@ -1081,7 +1060,7 @@ def near_zero_floor(
     demoting = band & (flat > ceiling)
     if not demoting.any():
         return None
-    atol = _round_up_sig(float(absolute_error[demoting].max()) * EMIT_HEADROOM)
+    atol = float(absolute_error[demoting].max())
     if atol == 0:
         return None
     atol = min(atol, EMIT_MAX_NEAR_ZERO_ATOL)
@@ -1233,29 +1212,23 @@ def finish_emit(arch, testsfailed: int, path=None, exitstatus=0) -> WriteReport:
     return write_table(path or _TABLE_PATH, date.today())
 
 
-def _verdict(
-    measured: int, out_fmt: str, in_fmt: Optional[str] = None, exact: bool = False
-) -> Tuple[str, int]:
+def _verdict(measured: int, out_fmt: str) -> Tuple[str, int]:
     """What the table should say for a measured worst lane on *out_fmt*.
 
-    ``("ulp", budget)`` while the measurement fits the table's ``usable_budget_ceiling``
-    -- 419,430 steps for fp32, 51 for fp16, 6 for bf16, 25 for Bfp8_b -- with the
-    budget the 1.1x headroom gives, capped at the ceiling. ``("tolerance", budget)``
-    once the measurement itself is past it, with the budget it would have needed; the
-    row records only the measurement, from which this derives that budget again.
-    Decided per cell and before collapsing, because it depends on the output format and
-    collapsing may drop it.
+    ``("ulp", measured)`` while the measurement fits the table's
+    ``usable_budget_ceiling`` -- 419,430 steps for fp32, 51 for fp16, 6 for bf16, 25
+    for Bfp8_b. The measurement is the gate: no headroom over it, so any movement at
+    all fails the nightly, and a worse figure is recorded by a re-emit, which the PR
+    guard reads as a raise. ``("tolerance", measured)`` once the measurement is past
+    the ceiling: a step budget there would no longer be *tighter* than the tolerance it
+    replaces, and since the ULP arm of ``passed_test`` returns before both isclose and
+    PCC, it would be the whole gate. Decided per cell and before collapsing, because
+    it depends on the output format and collapsing may drop it.
 
-    Without this the sweep enrols what it should not. ``Abs`` measures 393 steps on a
-    Bfp8_b output from a bf16 input -- the block exponent quantizing a small element, not
-    the op -- and a 433-step budget on a format whose ceiling is 25 gates nothing.
-
-    Headroom is 1.1x, except at zero on an input the sweep enumerates (*in_fmt*, see
-    :func:`is_exhaustive`): it saw every value, so a measured 0 means the op is exactly
-    rounded on this format, and widening it to 1 retires that claim. A strided Float32
-    input saw 65,280 of 2**32, and a finite sample cannot assert exactness, so its 0 is
-    written as 1 -- the table's rule for sampled rows -- unless the op is *exact* on the
-    cell (:func:`_is_exact`), whose 0 is the construction's, not the sample's.
+    Without the ceiling the sweep enrols what it should not. ``Abs`` measures 393 steps
+    on a Bfp8_b output from a bf16 input -- the block exponent quantizing a small
+    element, not the op -- and a 393-step budget on a format whose ceiling is 25 gates
+    nothing.
     """
     from helpers.format_config import DataFormat
     from helpers.sfpu_accuracy_budget import usable_budget_ceiling
@@ -1270,59 +1243,37 @@ def _verdict(
         # Bfp8_b output from random mixed-magnitude blocks (the table's Bfp8_b note) and
         # 393 from the sorted sweep. Enrolling the second would hide the first.
         return ("block", measured)
-    # In exact arithmetic: `100 * 1.1` is 110.00000000000001 in binary floating point,
-    # so a float ceil wrote 111, one step past the rule. And from `str`: `Fraction(1.1)`
-    # is the binary double, which gives 12 for a measured 10 where the rule says 11.
-    budget = math.ceil(Fraction(measured) * Fraction(str(EMIT_HEADROOM)))
-    if (
-        budget == 0
-        and not exact
-        and in_fmt is not None
-        and not is_exhaustive(DataFormat[in_fmt])
-    ):
-        budget = 1
-    ceiling = usable_budget_ceiling(DataFormat[out_fmt])
-    if budget > ceiling:
-        if measured <= ceiling:
-            # The kernel meets the gate and only the headroom does not (a bf16 cell
-            # measuring 6, ceiling 6). Cap at the ceiling: still stronger than the tolerance
-            # it replaces, with zero slack so any drift fails.
-            return ("ulp", int(ceiling))
-        # Only reached with the measurement itself past the ceiling: no budget would be
-        # tighter than the tolerance. The row records the measurement as `measured`.
-        return ("tolerance", budget)
-    return ("ulp", budget)
+    if measured > usable_budget_ceiling(DataFormat[out_fmt]):
+        return ("tolerance", measured)
+    return ("ulp", measured)
 
 
 def _decide(
     cells: Dict[Tuple[str, str, str, str], Union[int, "Floored", Unmeasurable]],
-    op_name: Optional[str] = None,
 ) -> Dict[Tuple, Tuple]:
     """Each measured cell as ``(verdict, measured, extra)``; an unmeasurable one as
     ``(("unmeasurable", verdict), measured, None)``. The verdict is :func:`_verdict`'s
-    for the cell's output *and* input format -- a strided Float32 0 is written as 1 --
-    and for whether *op_name* is exact on that cell (:func:`_is_exact`).
+    for the cell's output format.
 
     A :class:`Floored` cell whose worst lane demotes it is judged on the lanes outside
-    its floor: enrolled at the residual's budget with ``extra = ("floor", atol,
-    max_ulp)``, or, when even those are past the ceiling, demoted with the floor that
-    was tried in ``extra = ("floor_short", atol, residual)`` so the note can say so."""
+    its floor: enrolled at the residual with ``extra = ("floor", atol)``, or, when even
+    those are past the ceiling, demoted with the floor that was tried in ``extra =
+    ("floor_short", atol, residual)`` so the note can say so."""
     decided = {}
     for key, v in cells.items():
-        exact = op_name is not None and _is_exact(op_name, key[0], key[1], key[3])
         if isinstance(v, Unmeasurable):
             decided[key] = (("unmeasurable", v), v.measured, None)
         elif isinstance(v, Floored):
-            plain = _verdict(v.max_ulp, key[1], key[0], exact)
-            floored = _verdict(v.residual, key[1], key[0], exact)
+            plain = _verdict(v.max_ulp, key[1])
+            floored = _verdict(v.residual, key[1])
             if plain[0] == "tolerance" and floored[0] == "ulp":
-                decided[key] = (floored, v.residual, ("floor", v.atol, v.max_ulp))
+                decided[key] = (floored, v.residual, ("floor", v.atol))
             elif plain[0] == "tolerance":
                 decided[key] = (plain, v.max_ulp, ("floor_short", v.atol, v.residual))
             else:
                 decided[key] = (plain, v.max_ulp, None)
         else:
-            decided[key] = (_verdict(v, key[1], key[0], exact), v, None)
+            decided[key] = (_verdict(v, key[1]), v, None)
     return decided
 
 
@@ -1505,29 +1456,24 @@ class UnplacedMeasurements(EmitRefused):
 #: cannot be regenerated from a measurement, so it is preserved rather than replaced
 #: even when this sweep covers its cell. The provenance fields are always the emitter's.
 _RENDERABLE_FIELDS = frozenset(
-    {"in", "out", "approx", "dest", "max_ulp", "metric", "near_zero_atol"}
-    | set(PROVENANCE_FIELDS)
+    {"in", "out", "approx", "dest", "metric", "near_zero_atol"} | set(PROVENANCE_FIELDS)
 )
 
 
 def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
     """One decided row's fields, and the comment it carries: only what no field holds
-    -- a not-measurable cell's lanes, the floor a demotion tried. The figure the budget
-    was derived from is ``measured``; what a demotion's budget would have needed is
-    ``_verdict``'s for that figure, so it is not written down to go stale."""
+    -- a not-measurable cell's lanes, the floor a demotion tried. The figure is
+    ``measured``, which on a ULP row is the gate; a floor is written exactly as derived
+    (``repr``), with no margin to go stale."""
     metric, value = row["verdict"]
     extra = row.get("extra")
-    floored = metric == "ulp" and extra is not None and extra[0] == "floor"
     fields: Dict[str, object] = {k: row[k] for k in KEY_AXES if k in row}
-    if metric == "ulp":
-        fields["max_ulp"] = value
-        if floored:
-            fields["near_zero_atol"] = f"{extra[1]:.2e}"
-    else:
+    if metric != "ulp":
         fields["metric"] = "tolerance"
+    elif extra is not None and extra[0] == "floor":
+        fields["near_zero_atol"] = repr(float(extra[1]))
     provenance = Provenance(
         measured=row["measured"],
-        measured_all=extra[2] if floored else None,
         nonfinite=(value.nonfinite or None) if metric == "unmeasurable" else None,
         run=run,
     )
@@ -1610,54 +1556,6 @@ def _replaceable(row: Row, emitted_cells: Set[Tuple[str, str]]) -> bool:
     return _covered(row, emitted_cells)
 
 
-def rounds_at_pack(in_fmt: str, out_fmt: str, dest: Optional[str]) -> bool:
-    """Whether a cell's output holds fewer mantissa bits than its input still has in
-    Dest: there the operand an exact op returns -- a selected value, an integer -- is
-    rounded at pack, as Abs, Neg and Identity's 1-step Float32 -> Float16_b cells record.
-    Dest keeps the input's precision except where a 32-bit input meets a 16-bit Dest
-    (*dest* ``"No"``), which the unpack has narrowed already. A 16-bit input keeps it in
-    a 16-bit Dest too: Float16 -> Float16_b at ``dest: "No"`` reads 1 step on Abs and
-    ReluMin. Format names and the ``dest`` value as the table writes them; *dest* None
-    means either.
-    """
-    from helpers.ulp import _ULP_DTYPES, has_ulp_gate, ulp_dtype
-
-    def mantissa_bits(name: str) -> int:
-        fmt = DataFormat[name]
-        return _ULP_DTYPES[ulp_dtype(fmt)].mantissa_bits if has_ulp_gate(fmt) else 0
-
-    if dest == "No" and DataFormat[in_fmt].is_32_bit():
-        return False
-    return mantissa_bits(out_fmt) < mantissa_bits(in_fmt)
-
-
-def _is_exact(
-    op_name: str,
-    in_fmt: Optional[str] = None,
-    out_fmt: Optional[str] = None,
-    dest: Optional[str] = None,
-) -> bool:
-    """Whether a measured 0 on this cell is *op_name*'s construction rather than its
-    sample: an op exact in every format, or an exact op on a cell the pack cannot round
-    (:func:`rounds_at_pack`). On a cell that does round, a passed-through value is
-    rounded, so a strided 0 says only that no sample hit a tie: the walk holds one
-    fp32 -> bf16 tie, which ReluMin and UnaryMin send to a constant (0 steps) and Abs
-    passes through (1 step). A cell that leaves `in` or `out` open cannot be judged
-    and is taken as exact, as the table's op-wide canary rows are."""
-    from helpers.sfpu_accuracy_budget import (
-        EXACT_BY_CONSTRUCTION_OPS,
-        EXACT_IN_EVERY_FORMAT_OPS,
-    )
-
-    if op_name in {op.name for op in EXACT_IN_EVERY_FORMAT_OPS}:
-        return True
-    if op_name not in {op.name for op in EXACT_BY_CONSTRUCTION_OPS}:
-        return False
-    if in_fmt is None or out_fmt is None:
-        return True
-    return not rounds_at_pack(in_fmt, out_fmt, dest)
-
-
 def _block_end(lines: List[str], start: int) -> int:
     """The index past an op block starting at *start*: its indented and blank lines,
     less the blank lines after it, which are left for the next block."""
@@ -1727,7 +1625,7 @@ def write_table(path, run: date) -> WriteReport:
             kept_verbatim[name] = ", ".join(why)
             i = end
             continue
-        out.extend(_render(lines[i], _collapse(_decide(cells, name)), run))
+        out.extend(_render(lines[i], _collapse(_decide(cells)), run))
         # Rows this run did not supersede -- a format it does not reach, an arch-keyed
         # entry -- are the measurement of a different run and stay as they are, naming
         # it. Replacing a whole op block deleted them.

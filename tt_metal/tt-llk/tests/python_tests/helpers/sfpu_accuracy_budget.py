@@ -57,8 +57,7 @@ MEASURED_ARCH = ChipArchitecture.WORMHOLE
 
 #: Ops exact by construction: a sign-bit change, a copy, an integer, a predicate's
 #: 1.0/0.0, a constant, a selection or a clamp. A measured 0 on one of these states what
-#: the op guarantees, so the emitter keeps it even from a strided sample, where any
-#: other op's 0 is written as 1. test_sfpu_accuracy_budget.py's finer-grained lists
+#: the op guarantees. test_sfpu_accuracy_budget.py's finer-grained lists
 #: (EXACT_BY_CONSTRUCTION, EXACT_ZERO_BY_CONSTRUCTION, EXACT_SELECTIONS) must cover
 #: exactly this set.
 EXACT_BY_CONSTRUCTION_OPS = frozenset(
@@ -118,7 +117,7 @@ EXACT_BY_CONSTRUCTION_OPS = frozenset(
 #: a predicate's 1.0/0.0, a sign, or a constant -- so not even a cell whose output is
 #: narrower than its input has anything for the pack to round. Every other exact op
 #: returns an operand or an integer, which the pack rounds where the output cannot hold
-#: it (``ulp_sweep.rounds_at_pack``): there a sampled 0 is the sample, not the op.
+#: it (Abs, Neg and Identity's 1-step Float32 -> Float16_b cells).
 #: test_sfpu_accuracy_budget.py's EXACT_IN_EVERY_FORMAT must be exactly this set.
 EXACT_IN_EVERY_FORMAT_OPS = frozenset(
     {
@@ -390,7 +389,9 @@ _KEY_FIELDS: Dict[str, str] = {
     "dest": "dest_acc",
     "arch": "arch",
 }
-_CONTRACT_FIELDS = frozenset({"metric", "max_ulp", "near_zero_atol", "atol", "rtol"})
+#: The row fields that spell a contract. A ULP row's budget is not among them: it is
+#: the row's ``measured`` figure, read off the provenance fields.
+_CONTRACT_FIELDS = frozenset({"metric", "near_zero_atol", "atol", "rtol"})
 
 
 def _enum_member(enum_cls: Type[E], value: Any, where: str) -> E:
@@ -443,12 +444,16 @@ def _row_to_entry(
     )
     contract = {field: row[field] for field in _CONTRACT_FIELDS if field in row}
     metric = _enum_member(Metric, contract.pop("metric", "ulp"), where)
+    # The resolved metric, not the raw scalar: `metric: TOLERANCE` names the member too.
+    # First, so a ULP row without its figure is refused as that rather than as a
+    # contract with no budget.
+    check_provenance(where, row, tolerance=metric is Metric.TOLERANCE)
+    if metric is Metric.ULP:
+        # The measurement is the gate: there is no second number to raise by hand.
+        contract["max_ulp"] = row["measured"]
     # AccuracyContract.__post_init__ owns the rest of the validation, so a row that is
     # half-converted between the two metrics is refused there rather than here.
-    entry = key, AccuracyContract(metric=metric, **contract)
-    # The resolved metric, not the raw scalar: `metric: TOLERANCE` names the member too.
-    check_provenance(where, row, tolerance=metric is Metric.TOLERANCE)
-    return entry
+    return key, AccuracyContract(metric=metric, **contract)
 
 
 def _load_table(path: Path = _TABLE_PATH) -> Dict[MathOperation, _BudgetTable]:
