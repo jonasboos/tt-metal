@@ -51,6 +51,133 @@ regular pool and still about 45% slower than 09-14. Power class (8 kW vs 14 kW) 
 the explanation. tt-train's MFU gap between the pools (#56782) is real, but it is a different
 effect.
 
+## Update 2026-10-20 (overnight investigation)
+
+### Prior work: issue #58457 (mtairum, 2026-09-29)
+
+#58457 reached the same conclusion three weeks earlier. Old code (`f8c4ce59dd0`) with the new
+SFPI was slow, and new code with the old SFPI and old Docker image was slow, so the cause is
+outside the source tree and the image. The UMD bump was also reverted on 09-18 (`b99aa035f39`),
+and nightlies 09-19 to 09-25 ran with the pre-window UMD and were still slow. Their proposed next
+step, a per-stage profile of one decode, was never posted. Facts from that issue used here:
+
+- About 215 device ops per decode: 35 `conv3d`, 33 `neighbor_pad_async`, 23 `to_layout` each way,
+  30 `dit_rms_norm_unary_fused`, 4 `all_gather_async`.
+- Unchanged on the same nights and machines: Flux.2 VAE decode (traced, 0.154–0.158 s), Wan DiT
+  denoise (eager, about 160k ops, 56.9 s), Wan text encoder (0.08 s).
+- I2V: VAE decode +0.34 s and VAE **encode** +0.28 s, so the cost is in the VAE's ops, not the
+  large readback.
+
+### The same physical hosts got slower (fleet-wide change)
+
+The job logs print the host (`Detected Hosts: bh-glx-120-…`). Across all 196 sc1 Wan T2V/I2V jobs
+from 09-05 to 10-20:
+
+| Host | Before | After |
+|---|---|---|
+| `bh-glx-120-d06u02` | 09-08: 480p 0.288 s, 720p 0.579 s; 09-10 I2V 0.673 s | 09-21: 0.731/1.022 s; 10-02: 0.751/1.000 s; 10-17 (probe A): 0.752/1.021 s |
+| `bh-glx-120-d03u08` | 09-09 I2V 0.676 s | 09-15: 720p 1.148 s |
+
+Every run up to **2026-09-14 03:33 UTC** is fast (480p 0.29–0.43 s). Every run from
+**2026-09-15 13:18 UTC** onward is slow (0.68–0.85 s), on every host in the pool and on both
+denoise speed classes (≈40 s and ≈57 s). Machines were not swapped; all of them changed.
+
+The CI setup flow (`ttop-recovery`: IPMI reset of all cards, then cluster validation and link
+traffic test, "All Detected Links are healthy") is identical in the 09-14 and 09-16 logs. KMD,
+firmware and the set of UMD/Metal/Fabric log messages are also identical once numbers are
+normalised.
+
+### Candidate: host CPU power management
+
+This dev host (`bh-glx-120-b10u02`, same fleet, reproduces 0.689 s) runs `acpi-cpufreq` with the
+`schedutil` governor (1.5–3.25 GHz, cores idling at 1.5 GHz). The deepest idle state is **C2 with
+an 800 µs exit latency**, enabled, and the kernel command line is only `iommu=pt` (no
+`processor.max_cstate` or `idle=poll`). The KMD has `power_policy=Y`,
+`idle_power_down_grace_ms=5000`. If the 09-15 maintenance changed a BIOS or OS power profile, a
+host thread that sleeps between device operations pays up to about 0.8 ms per wake-up. A few
+hundred such waits in an eager, device-bound VAE would add about 0.4 s, while leaving the
+throughput-bound denoise and the short text encoder unchanged.
+
+Probe D1 tests this directly, along with other candidates. **D1 ruled C-states out** (see the next
+section).
+
+## Root cause (2026-10-20): torch OpenMP threads collide with Weka's busy-polling cores
+
+### Probe D1: the extra time is in the readback, not the decoder
+
+Branch `jameslee/probe-60670-D1-diag`, run 39385870365, host `bh-glx-120-d04u14`. The VAE runs
+alone (no transformer, no denoise) on `f8c4ce59dd0`.
+
+| Stage | 480p | 720p |
+|---|---|---|
+| Host prep + upload of latents | 0.05 s | 0.07–0.11 s |
+| **Decoder forward** (35 `conv3d`, 33 `neighbor_pad_async`, …) | **0.245 s** | 0.515 s |
+| **`float_to_uint8` + `.cpu()` + host reassembly** | **0.40–0.47 s** | **0.41–0.43 s** |
+| Total (same as the perf test's `vae` metric) | 0.70–0.77 s | 1.00–1.04 s |
+
+- The decoder forward alone (0.245 s) is less than the whole good-era VAE (0.324 s). The device
+  ops and collectives are fine.
+- `neighbor_pad` forced to 1 link: no gain (0.79 s). A heat soak before decoding: no change.
+- 64 `SCHED_IDLE` spinner processes (one per CPU, which removes C-states): **worse**, 1.43 s. The
+  slow part is CPU-contention-sensitive.
+- Note: the `HOSTENV` shell dump in D1 ran on the GitHub runner pod, not on the galaxy host. In
+  the multihost flow, the job command runs on the pod and `mpirun` starts the test on the host.
+
+### Probe D2: it is `_reassemble_2d`, a host-side torch loop
+
+Branch `jameslee/probe-60670-D2-d2h`, run 39435646808, host `bh-glx-120-d04u08` (AMD EPYC 9354P,
+32 cores / 64 threads, kernel 6.8.0-106, `iommu=pt`, KMD 2.11.0, PCIe Gen5, 28 chips x1 and 4 chips
+x8).
+
+| Readback step | 480p | 720p |
+|---|---|---|
+| `float_to_uint8` (device) | 2 ms | 2 ms |
+| `.cpu(blocking=False)` call + sync (the actual D2H) | 6–7 ms | 8–10 ms |
+| `_to_torch_zero_copy` × 32 | 0.5 ms | 0.4 ms |
+| **`_reassemble_2d`** (32 strided `permute().contiguous()` copies into the output) | **424–449 ms** | **396–468 ms** |
+
+The D2H transfer itself is fast: 537 MB from 32 chips in 25 ms. A single torch permute of the whole
+230 MB video takes 35 ms on the same host in the same process. The reassembly is about 13 ms per
+shard regardless of size.
+
+### Local reproduction, pure torch, no device (`bh-glx-120-b10u02`, same host type)
+
+Replicating `_reassemble_2d` with 32 random uint8 shards (480p shapes):
+
+| torch threads / CPUs | reassemble | whole-tensor permute |
+|---|---|---|
+| 1 / 64 | 109 ms | 101 ms |
+| 16 / 64 | 15 ms | 13 ms |
+| 32 / 64 | **16 ms** | 12 ms |
+| **64 / 64** | **433 ms** (720p: 483 ms) | 18 ms |
+| 60 / 60 (CPUs 1, 33, 2, 34 excluded) | **16.7 ms** | 11 ms |
+
+On this host, `wekanode` (the Weka storage client) has two threads pinned to **CPU 1 and CPU 2 at
+100%**. Everything else is idle (mean busy 4%). CPUs 33 and 34 are their SMT siblings.
+`/opt/weka` and `/etc/wekaio` were created here on 2026-09-21.
+
+### Mechanism
+
+1. `models/tt_dit/tests/conftest.py` sets `torch.set_num_threads(os.cpu_count())`, which is 64
+   on these hosts. That line has not changed since March 2026, and both good and bad CI logs print
+   `Setting torch num_threads to 64`.
+2. The galaxy hosts now run the Weka client with two polling threads pinned at 100% on CPUs 1 and
+   2, which also slows their SMT siblings.
+3. Each of `_reassemble_2d`'s 32 per-shard copies is an OpenMP parallel region. Each region waits
+   at its barrier for the threads that share a core with a Weka poller, about 13 ms per shard, so
+   **+0.4 s per VAE pass**. One large op (the whole-tensor permute, or anything in denoise) pays
+   that wait once and barely notices, which is why only the Wan VAE regressed. The I2V VAE encode
+   path does similar host-side torch work.
+
+This fits every earlier observation: the same code, same image and same KMD/firmware are slow on
+every host after the change; it is a fixed cost independent of resolution; it is Blackhole-galaxy
+specific (WH galaxy hosts are a different fleet); it is not C-states (spinners make it worse).
+
+**Still to confirm:** that the CI galaxy hosts have the same busy cores, and when Weka was rolled
+out to them. On this dev host it was 09-21; the CI pool's first slow run is 09-15 13:18 UTC.
+Probe E (below) checks per-CPU load on a CI host and runs the real perf test with 32 vs 64 torch
+threads.
+
 **Asks:**
 
 1. CI/infra: what changed on the BH sc1 (`multihost-ci-sc1-*`) machines on 2026-09-14/15?
