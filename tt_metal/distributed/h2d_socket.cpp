@@ -4,6 +4,7 @@
 
 #include <tt-metalium/experimental/sockets/h2d_socket.hpp>
 #include <internal/service/service_core_manager.hpp>
+#include <internal/l1_ecc_halt.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include "tt_metal/distributed/mesh_socket_utils.hpp"
 #include <tt-metalium/experimental/sockets/named_shm.hpp>
@@ -726,7 +727,9 @@ H2DSocket::~H2DSocket() noexcept {
 
 void H2DSocket::reserve_bytes(uint32_t num_bytes) {
     uint32_t bytes_free = fifo_size_ - (bytes_sent_ - bytes_acked_);
+    tt::tt_metal::internal::L1EccHaltWatch ecc_watch(mesh_device_);
     while (bytes_free < num_bytes) {
+        ecc_watch.stalled();
         advance_h2d_simulator_socket_device(mesh_device_, recv_core_.device_coord);
         tt_driver_atomics::mfence();
         volatile uint32_t bytes_acked_value = bytes_acked_ptr_[0];
@@ -838,7 +841,9 @@ void H2DSocket::barrier(std::optional<uint32_t> timeout_ms) {
     refresh_connector_write_state();
     volatile uint32_t bytes_acked_value = bytes_acked_ptr_[0];
     auto start_time = std::chrono::high_resolution_clock::now();
+    tt::tt_metal::internal::L1EccHaltWatch ecc_watch(mesh_device_);
     while (bytes_sent_ - bytes_acked_value != 0) {
+        ecc_watch.stalled();
         refresh_connector_write_state();
         advance_h2d_simulator_socket_device(mesh_device_, recv_core_.device_coord);
         tt_driver_atomics::mfence();
@@ -848,6 +853,7 @@ void H2DSocket::barrier(std::optional<uint32_t> timeout_ms) {
                                   std::chrono::high_resolution_clock::now() - start_time)
                                   .count();
             if (elapsed_ms > timeout_ms.value()) {
+                ecc_watch.check_now();
                 TT_THROW(
                     "Timeout waiting for device to send acknowledgement over H2D socket. Bytes sent: {}, Bytes "
                     "acknowledged: {}",
