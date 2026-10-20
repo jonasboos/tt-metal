@@ -200,32 +200,43 @@ writes nothing.
 
 ```yaml
 MyOp:
-  - {in: Float16_b, out: Float16_b, measured: 1, run: 2026-09-23}
-  - {in: Float16, out: Float16_b, metric: tolerance, measured: 14337, run: 2026-09-23}
+  - {in: Float16_b, out: Float16_b, run: 2026-09-23, domains: [{low: -.inf, high: .inf, ulp: 1}]}
+  - {in: Float16, out: Float16_b, run: 2026-09-23, domains: [{low: -.inf, high: -4, ulp: 14337}, {low: -4, high: .inf, ulp: 1}]}
   - {in: Float16_b, out: Bfp8_b, metric: tolerance, measured: 393, run: 2026-09-23}
 ```
 
-Every row records `measured`, the worst lane, and `run`, the day the sweep measured it
-(a functional driver's row says `sampled:` instead). On a ULP row `measured` *is* the
-gate: there is no headroom over it. The comment is for people. Five verdicts:
+Every row records `run`, the day the sweep measured it (a functional driver's row says
+`sampled:` instead), and what it measured: a `domains` list on every cell with a
+per-element ULP, or a `measured` figure on the rest. A figure *is* the gate: there is
+no headroom over it. The comment is for people. Five verdicts:
 
-- **`measured: N`**, no `metric` — enrolled. The sweep holds the cell to exactly `N`
-  steps: a reading one step worse fails it, and a re-emit that records the worse figure
-  is a raised gate the PR guard reports. A measured 0 stays 0, on the strided `Float32`
-  input too: the stride is a fixed set of values, and the figure is a measurement of it.
-- **`measured: R, near_zero_atol: A`** — enrolled with a floor: `R` is the worst lane
-  outside it. The step count is a difference of bit-pattern ranks, so a lane where the
-  hardware answers 0 for a 2e-9 the golden still holds reads as 2^29 fp32 steps, and one
-  such lane demoted the whole cell. Lanes under 1 % of the cell's largest golden (and
-  under `A/0.01`) are judged on absolute error instead; `A` is exactly the largest
-  absolute error among the band lanes past the ceiling, written as measured, and `R`
-  gates everything outside it. The emitter grants a floor up to
-  `ulp_sweep.EMIT_MAX_NEAR_ZERO_ATOL` (1e-3); a cell that would need more is demoted,
-  and its comment says what the floor would have left.
-- **`metric: tolerance, measured: N`** on a step-gateable output — demoted: the
-  measurement itself is past `usable_budget_ceiling`, so a step budget would no longer
-  be *tighter* than the tolerance it replaces. The op keeps tolerance + PCC on that
-  cell, and `measured` is what the headroom report holds it to.
+- **`domains: [{low: L, high: H, ulp: U}, …]`** — every cell with a per-element ULP,
+  one list over the whole swept range ("Where an op holds its figure", below). An entry
+  within the output's usable ceiling is gated at its figure: the sweep holds its lanes to
+  exactly `U` steps, a reading one step worse fails it, and a re-emit that records the
+  worse figure is a raised gate the PR guard reports. An entry past the ceiling is
+  measured, not gated, and the headroom report holds it to its figure. `ulp: null` is
+  an entry where no lane is ranked. A one-domain op gets a one-entry list, so every
+  such row reads the same way. A measured 0 stays 0, on the strided `Float32` input
+  too: the stride is a fixed set of values, and the figure is a measurement of it.
+- **`near_zero_atol: A`** beside the list — a floor: the step count is a difference of
+  bit-pattern ranks, so a lane where the hardware answers 0 for a 2e-9 the golden still
+  holds reads as 2^29 fp32 steps, and one such lane demoted the whole cell. Lanes under
+  1 % of the cell's largest golden (and under `A/0.01`) are judged on absolute error
+  instead; `A` is exactly the largest absolute error among the band lanes past the
+  ceiling, written as measured, and every entry's figure is over the lanes outside it.
+  The emitter grants a floor up to `ulp_sweep.EMIT_MAX_NEAR_ZERO_ATOL` (1e-3); a cell
+  that would need more keeps its list without one, and the entries show where it falls
+  past the ceiling.
+- **`measured: N`**, no `metric` — a row a functional driver sampled (the binary,
+  ternary and scalar ops, and the hand-built unary sweeps). The driver holds the cell to
+  exactly `N` steps.
+- **`metric: tolerance, measured: N`** on a step-gateable output — a row the drivers
+  sampled past `usable_budget_ceiling`, where a step budget would no longer be *tighter*
+  than the tolerance it replaces. The op keeps tolerance + PCC on that cell, and
+  `measured` is what the headroom report holds it to. A list whose largest figure is
+  past the ceiling implies the same for its whole cell, while its entries within the
+  ceiling stay gated.
 - **`metric: tolerance, measured: N`** on a block-float output — block-quantized. The sweep
   enumerates a format in value order, so sixteen adjacent values share a `Bfp8_b` block
   and the exponent fits all of them: the best case for quantization, not a
@@ -271,6 +282,10 @@ pytest test_sfpu_accuracy_budget.py test_ulp_sweep.py test_ulp_provenance.py -q
 - **A gate is a measurement, swept or sampled.** The drivers seed their stimuli, so a
   sampled row's figure is reproducible and gates like the sweep's; neither carries an
   envelope.
+- **The list is the statement.** A row with `domains` carries no `measured`, `metric`
+  or `sampled` beside it, pins the `in` and `out` it was measured on, and names its
+  `run`; the loader refuses anything else. An entry never widens or narrows what the op
+  claims (`claimed_lanes`): it reports where the claim holds, and at what figure.
 - **A gated cell is not parked quietly.** A `not measurable` verdict on a gateable output
   has to be acknowledged in `_UNMEASURABLE_CELLS_ACKNOWLEDGED` with its cause, or the
   lanes behind it named in `_KNOWN_NONFINITE_LANES` with their issue.
@@ -312,6 +327,74 @@ rounding -- `Softplus` answers 0 below x = -5 where the answer is up to 0.0065, 
 approximate `Gelu` is 0.024 off -- and stays a hand decision: the demoted row records
 the floor it would have needed.
 
+## Where an op holds its figure: domains
+
+One line per format combination says how the op behaves over the whole swept range:
+
+```yaml
+Tanh:
+  - {in: Float16_b, out: Float16_b, approx: "Yes", dest: "No", run: 2026-10-20, domains: [{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]}
+Log:
+  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-20, domains: [{low: -.inf, high: 0, ulp: null}, {low: 0, high: .inf, ulp: 1}]}
+Abs:
+  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-20, domains: [{low: -.inf, high: .inf, ulp: 0}]}
+```
+
+Read: approximate `tanh` is 3 steps everywhere except on `[-1, 1)`, where it is 10,
+past bfloat16's ceiling of 6 — that one entry is why the cell as a whole is not
+gated, and the two others are gated at 3. `log` answers nothing below 0 and is 1 step
+from 0 up. `abs` is exact over the whole range.
+
+- **An entry** `{low: L, high: H, ulp: U}` holds the lanes whose input, *as the kernel
+  received it* (`ulp_sweep.received_inputs`: block-quantized for `Bfp8_b`/`Bfp4_b`,
+  truncated to the 16-bit Dest for a `Float32` input at `dest: "No"`), satisfies
+  `L <= x < H`. `U` is the worst ranked lane there, outside the row's near-zero floor
+  if it has one; `null` means no lane there is ranked: past the op's claim (`cos`
+  beyond 65504), undefined (`log` below 0, every value below -128 for `lgamma`), or an
+  answer the Dest cannot hold. Which lanes an op claims stays in code
+  (`_CLAIM_LIMIT`, `_OP_SINGULARITIES`, `_NONPOSITIVE_INTEGER_POLES`); the list reports
+  it.
+- **Gated or not follows the figure.** An entry within `usable_budget_ceiling` of the
+  output (6 for `Float16_b`, 51 for `Float16`, 419,430 for `Float32`) is gated at it;
+  one past the ceiling is measured and held to its figure by the headroom report. The
+  whole-cell contract `accuracy_contract` hands to callers that do not look at domains
+  (the functional drivers) is derived: gated at the largest figure when every entry is
+  within the ceiling, tolerance otherwise.
+- **The list is contiguous and complete**: the first `low` is `-.inf`, the last `high`
+  is `.inf`, each `high` is the next `low`, and every interior edge is `0` or a power
+  of two, written in its shortest exact form (`0.00390625`, `65536`,
+  `8.507059173023462e+37`).
+- **The emitter draws it** from the sweep's per-lane distances (`ulp_domains`): the
+  worst ranked lane per signed binade of the received input, split where it crosses the
+  ceiling (`DOMAIN_CLASS_BITS` would split the gateable range into step classes as
+  well; the binary rule is the question asked, and factor-2 classes gave eight times
+  the entries for the pack path's 0-vs-1 flicker between binades), a binade with fewer
+  than `DOMAIN_MIN_BIN_LANES` lanes folded into its neighbour, a gateable domain under
+  `DOMAIN_MIN_LANES` ranked lanes folded into the neighbour at least as loose (a bad
+  region is never hidden that way), an edge with no swept lane between it and zero
+  written as `0`. A lane the row's floor covers counts as ranked at 0 steps when the
+  list is drawn -- it is held, by the floor -- so the near-zero band draws no entry of
+  its own, and an entry the floor covers entirely reads `0`. Every entry's figure is
+  then measured over exactly its lanes outside the floor, so what is written is what
+  the gate holds them to.
+- **The sweep gates entry by entry.** Each gateable entry's lanes are held to its
+  figure with the row's floor; the ranked lanes a `null` entry leaves (a stray lane in
+  an otherwise unranked binade) are held to the row's largest figure, so no ranked lane
+  goes unjudged. A failure names the entry.
+- **The headroom report judges entry by entry too**: the `--ulp-measure` row carries
+  the reading over each entry of the table's list (`domains`) and the per-binade profile
+  it was drawn from (`bins`), and `python3 helpers/ulp_budget_diff.py domains --measured
+  ulp.jsonl [--op Cos] [--table helpers/sfpu_accuracy_budget.yaml]` prints, from that
+  artifact and no device, the list the rule would draw today beside the one the table
+  holds.
+- **The PR guard judges segment by segment**: over the union of both revisions' edges,
+  an entry raised, a list replaced by a looser one, or a plain row turned into a list
+  are each reported for exactly the lanes they change, with the range on the line, and
+  a list redrawn with the same figures is no change at all.
+
+The hand-written `atol`/`rtol` anchors (`GeluAppx`, `SigmoidAppx`) are kept verbatim
+by the emitter and so carry no list until those anchors move onto rows.
+
 ## Gotchas
 
 - **Any host pytest run in `tests/` wipes `/tmp/tt-llk-build`.** Chain
@@ -347,4 +430,5 @@ the floor it would have needed.
 | `python_tests/helpers/sfpu_accuracy_budget.yaml` | the table |
 | `python_tests/helpers/sfpu_accuracy_budget.py` | how a row is resolved |
 | `python_tests/helpers/ulp_provenance.py` | the table read as rows, and each row's provenance fields |
+| `python_tests/helpers/ulp_domains.py` | the `domains` list: its meaning, the rule that draws it, its one spelling |
 | `python_tests/helpers/ulp_budget_diff.py` | the CI comparison, and the headroom report (from #57527) |

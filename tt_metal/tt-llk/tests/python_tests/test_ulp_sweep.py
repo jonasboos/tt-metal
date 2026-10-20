@@ -24,8 +24,10 @@ from helpers.chip_architecture import ChipArchitecture
 from helpers.format_config import DataFormat, InputOutputFormat
 from helpers.llk_params import ApproximationMode, DestAccumulation, MathOperation
 from helpers.ulp import has_ulp_gate
+from helpers.ulp_domains import Domain
 from helpers.ulp_provenance import BudgetTable, Provenance
 from helpers.ulp_sweep import (
+    DOMAINS,
     MEASURED,
     AmbiguousCollapse,
     IncompleteGrid,
@@ -97,8 +99,10 @@ def table(tmp_path):
     path = tmp_path / "budget.yaml"
     path.write_text(_TABLE, encoding="utf-8")
     MEASURED.clear()
+    DOMAINS.clear()
     yield path
     MEASURED.clear()
+    DOMAINS.clear()
 
 
 def _assert_kept(before, after, op, *keys):
@@ -413,7 +417,7 @@ def test_an_incomplete_grid_is_refused_rather_than_collapsed(table):
     with _refuses(AmbiguousCollapse) as caught:
         write_table(table, _RUN)
     assert caught.value.key == ("Float16", "Float16")
-    assert {measured for _, measured, _ in caught.value.values} == {4, 9}
+    assert {measured for _, measured, *_ in caught.value.values} == {4, 9}
     assert "measurements onto ('Float16', 'Float16')" in str(caught.value)
     assert table.read_text() == before
 
@@ -1933,3 +1937,135 @@ def test_the_plugin_prints_the_emit_summary_on_a_clean_session(
     assert (
         BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16").max_ulp == 5
     )
+
+
+# ── A cell's `domains` list ──────────────────────────────────────────────────
+
+_INF = math.inf
+_ONE = (Domain(-_INF, _INF, 5),)
+_TWO = (Domain(-_INF, 0, 5), Domain(0, _INF, 2))
+
+
+def test_a_cell_with_a_list_is_written_as_the_list_and_nothing_else(table):
+    """The list is the statement: beside the key and the run there is no `measured`
+    and no `metric`, and the loader derives the contract from the entries."""
+    from helpers.sfpu_accuracy_budget import _load_table
+
+    _record_grid("Gelu", "Float16", "Float16", 5, domains=_ONE)
+    write_table(table, _RUN)
+    row = BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16")
+    assert set(row.values) == {"in", "out", "run", "domains"}
+    assert row.domains == _ONE and row.max_ulp == 5
+    assert row.provenance == Provenance(run=_RUN)
+    (contract,) = [
+        c
+        for k, c in _load_table(table)[MathOperation.Gelu].items()
+        if k.input_format is DataFormat.Float16
+    ]
+    assert (contract.max_ulp, contract.domains) == (5, _ONE)
+
+
+def test_a_floor_is_written_beside_the_list_whatever_the_whole_cells_verdict(table):
+    """The entries were measured outside the floor, so the floor is part of the gate on
+    each of them even when the cell as a whole is past the ceiling."""
+    past = (Domain(-_INF, 0, 14337), Domain(0, _INF, 100))
+    _record_grid("Gelu", "Float16", "Float16", _WORST, floor=(100, 1e-3), domains=past)
+    write_table(table, _RUN)
+    row = BudgetTable.load(table).row("Gelu", in_="Float16", out="Float16")
+    assert (row.metric, row.max_ulp, row.near_zero_atol) == ("tolerance", None, 1e-3)
+    assert row.domains == past and "measured" not in row.values
+
+
+def test_lists_are_part_of_what_a_collapse_must_agree_on(table):
+    """Two cells with one figure and different lists are two rows."""
+    for approx in ("No", "Yes"):
+        for dest in ("No", "Yes"):
+            record(
+                "Gelu",
+                ("Float16", "Float16", approx, dest),
+                5,
+                domains=_ONE if approx == "No" else _TWO,
+            )
+    write_table(table, _RUN)
+    rows = [
+        r
+        for r in BudgetTable.load(table).rows_of("Gelu")
+        if r.pinned.get("in") == "Float16"
+    ]
+    assert sorted(r.pinned.get("approx") for r in rows) == ["No", "Yes"]
+    assert {r.pinned["approx"]: r.domains for r in rows} == {"No": _ONE, "Yes": _TWO}
+
+
+def test_a_list_survives_the_xdist_merge_and_a_differing_reading_drops_it():
+    record("Abs", _CELL, 5, domains=_TWO)
+    rows = export_measured()
+    MEASURED.clear()
+    DOMAINS.clear()
+    merge_measured(rows)
+    assert DOMAINS["Abs"][_CELL] == _TWO
+    record("Abs", _CELL, 9, floor=(3, 1e-6), domains=_ONE)
+    assert (
+        MEASURED["Abs"][_CELL] == 9 and _CELL not in DOMAINS["Abs"]
+    )  # floors differ: neither
+    MEASURED.clear()
+    DOMAINS.clear()
+    record("Abs", _CELL, 5, domains=_TWO)
+    record("Abs", _CELL, 9, domains=_ONE)
+    assert (MEASURED["Abs"][_CELL], DOMAINS["Abs"][_CELL]) == (9, _ONE)
+    record("Abs", _CELL, 2, domains=_TWO)
+    assert (MEASURED["Abs"][_CELL], DOMAINS["Abs"][_CELL]) == (9, _ONE)
+    MEASURED.clear()
+    DOMAINS.clear()
+
+
+def test_the_tensor_side_draws_the_rule_on_the_lanes_and_measures_each_entry(
+    monkeypatch,
+):
+    """`binade_maxima` profiles the received inputs, `domain_figures` measures each
+    drawn span over exactly its lanes, and `entry_readings` is what the recorder
+    writes. The knobs are lowered so a tiny tensor can split."""
+    import helpers.ulp_domains as rule
+    from helpers.ulp_sweep import (
+        binade_maxima,
+        domain_figures,
+        entry_readings,
+        floor_covered,
+    )
+
+    monkeypatch.setattr(rule, "DOMAIN_MIN_BIN_LANES", 1)
+    monkeypatch.setattr(rule, "DOMAIN_MIN_LANES", 1)
+    x = torch.tensor(
+        [-3.0, -2.5, -1.5, -1.0, 0.5, 0.75, 1.5, 2.0, 3.0, 6.0], dtype=torch.float64
+    )
+    distance = torch.tensor([1, 2, 1, 1, 0, 0, 9, 8, 1, 1])
+    judged = torch.ones(10, dtype=torch.bool)
+    judged[3] = False  # -1.0 is not ranked
+    present = torch.ones(10, dtype=torch.bool)
+    bins = binade_maxima(x, distance, judged, present)
+    assert bins[rule.binade(-3.0)] == (2, 2, 2) and bins[rule.binade(1.5)] == (1, 1, 9)
+    assert bins[rule.binade(-1.0)] == (
+        2,
+        1,
+        1,
+    )  # -1.5 shares the binade; -1.0 is unranked
+    spans = rule.partition(bins, 6.0)
+    # 1.5 (9 steps) and 2.0 (8 steps) are both past bf16's ceiling of 6: one bad range.
+    assert spans == ((-_INF, 1.0, True), (1.0, 4.0, True), (4.0, _INF, True))
+    drawn = domain_figures(spans, x, distance, present, judged)
+    assert [d.ulp for d in drawn] == [2, 9, 1]
+    assert entry_readings(drawn, x, distance, present, judged) == [
+        [-_INF, 1.0, 2, 6],  # six ranked lanes; the figure is over the five outside
+        [1.0, 4.0, 9, 3],
+        [4.0, _INF, 1, 1],
+    ]
+    # An entry the floor covers entirely reads 0, not null: its lanes are held.
+    none_outside = torch.zeros(10, dtype=torch.bool)
+    assert domain_figures(spans, x, distance, present, none_outside)[0].ulp == 0
+    golden = torch.tensor([1.0, 1e-6, 2.0], dtype=torch.float32)
+    result = torch.tensor([1.0, 0.0, 2.5], dtype=torch.float32)
+    assert floor_covered(
+        golden, result, torch.ones(3, dtype=torch.bool), 1e-6
+    ).tolist() == [False, True, False]
+    assert not floor_covered(
+        golden, result, torch.ones(3, dtype=torch.bool), None
+    ).any()

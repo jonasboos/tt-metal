@@ -6,7 +6,9 @@
 Every row of ``sfpu_accuracy_budget.yaml`` that carries a budget says which measurement
 it came from in fields of its own -- ``measured``, ``nonfinite``, and ``run`` or
 ``sampled`` -- which PyYAML loads and the registry loader validates like any other
-field. On a ULP row ``measured`` is the gate itself: there is no second number. The comment beside a row is prose for people; no code reads it.
+field. On a ULP row ``measured`` is the gate itself: there is no second number. A
+row the exhaustive sweep wrote carries its ``domains`` list instead (``ulp_domains``),
+and no cell-level figure at all. The comment beside a row is prose for people; no code reads it.
 :class:`Provenance` is the typed view of the fields, and :class:`BudgetTable` is the one
 walk over the file, locating rows through PyYAML's own event stream rather than by the
 shape of a line.
@@ -23,6 +25,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
+
+if __package__:
+    from .ulp_domains import CEILINGS, DOMAINS_FIELD, Domain, contract_of, domains_text
+else:  # run by path on the slim runner, as ulp_budget_diff.py imports this module
+    from ulp_domains import CEILINGS, DOMAINS_FIELD, Domain, contract_of, domains_text
 
 #: The key dimensions of a row, in the order a cell is named.
 KEY_FIELDS = ("in", "out", "approx", "dest", "arch")
@@ -297,17 +304,56 @@ class Row:
         return dict(self.key)
 
     @property
+    def domains(self) -> Tuple[Domain, ...]:
+        """The row's ``domains`` as entries, or ``()`` on a row without a list -- or
+        with one this reader cannot make sense of; like ``provenance`` it is unchecked,
+        and ``ulp_domains.check_domains`` is the loader's refusal."""
+        value = self.values.get(DOMAINS_FIELD)
+        if not isinstance(value, list):
+            return ()
+        try:
+            return tuple(Domain(e["low"], e["high"], e["ulp"]) for e in value)
+        except (TypeError, KeyError, ValueError):
+            return ()
+
+    @property
+    def ceiling(self) -> Optional[float]:
+        """The usable ceiling of the row's output format, or ``None`` when the row does
+        not pin one with a per-element ULP."""
+        return CEILINGS.get(self.pinned.get("out", ""))
+
+    @property
     def metric(self) -> str:
+        """``ulp`` or ``tolerance``: the field, or on a row with a list what the list
+        implies (``ulp_domains.contract_of``)."""
+        domains = self.domains
+        if domains:
+            ceiling = self.ceiling
+            return "tolerance" if ceiling is None else contract_of(domains, ceiling)[0]
         return str(self.values.get("metric", "ulp"))
 
     @property
     def max_ulp(self) -> Optional[int]:
-        """The step budget -- the row's ``measured`` figure, which is the gate -- or
-        ``None`` on the tolerance metric."""
+        """The step budget -- the row's ``measured`` figure, which is the gate, or on a
+        row with a list the largest figure in it when every entry is within the ceiling
+        -- or ``None`` on the tolerance metric."""
+        domains = self.domains
+        if domains:
+            ceiling = self.ceiling
+            if ceiling is None:
+                return None
+            metric, figure = contract_of(domains, ceiling)
+            return figure if metric == "ulp" else None
         value = self.values.get("measured")
         if self.metric == "tolerance" or not _is_int(value):
             return None
         return value
+
+    @property
+    def unmeasurable(self) -> bool:
+        """Whether the sweep could not measure the row's cell: ``Provenance.unmeasurable``,
+        except that a row with a list measured its cell and says so entry by entry."""
+        return not self.domains and self.provenance.unmeasurable
 
     @property
     def near_zero_atol(self) -> Optional[float]:
@@ -479,11 +525,18 @@ def _skip_node(events: list, i: int) -> int:
             return i
 
 
+def _field_text(key: str, value: Any) -> str:
+    if key in ("approx", "dest"):
+        return f'{key}: "{value}"'  # quoted so YAML keeps them strings
+    if key == DOMAINS_FIELD:
+        # ``repr`` would spell an infinity ``inf``, which YAML reads as a string.
+        return f"{key}: {domains_text(value)}"
+    return f"{key}: {value}"
+
+
 def render_row(row_fields: Dict[str, Any], comment: str = "") -> str:
     """One inline row as the emitter writes it, with its newline. ``approx``/``dest``
-    quoted so YAML keeps them strings; a date unquoted so YAML reads it as one."""
-    body = ", ".join(
-        f'{k}: "{v}"' if k in ("approx", "dest") else f"{k}: {v}"
-        for k, v in row_fields.items()
-    )
+    quoted so YAML keeps them strings; a date unquoted so YAML reads it as one; a
+    ``domains`` list in ``ulp_domains``' one spelling."""
+    body = ", ".join(_field_text(k, v) for k, v in row_fields.items())
     return f"  - {{{body}}}" + (f"  # {comment}" if comment else "") + "\n"

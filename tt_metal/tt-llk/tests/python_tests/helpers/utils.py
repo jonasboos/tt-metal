@@ -614,7 +614,19 @@ def _consume_ulp_query() -> None:
         budget.LAST_QUERY, budget.PENDING_AMBIGUOUS = None, False
 
 
-def _record_ulp_measurement(distance, *, mask, nonfinite: int = 0) -> None:
+def _json_number(value):
+    """A float for JSON: an infinity as the string ``inf``/``-inf`` (JSON has none; the
+    readers turn it back with ``float``), anything else as it is."""
+    if value == float("inf"):
+        return "inf"
+    if value == float("-inf"):
+        return "-inf"
+    return value
+
+
+def _record_ulp_measurement(
+    distance, *, mask, nonfinite: int = 0, bins=None, domains=None
+) -> None:
     """Append the worst measurable lane of one comparison, tagged with its variant.
 
     ``ulp_stats`` rather than a bare ``max()``, so the number is the one the log
@@ -628,6 +640,11 @@ def _record_ulp_measurement(distance, *, mask, nonfinite: int = 0) -> None:
     *nonfinite* is how many lanes the hardware and the golden disagree about being
     finite (``ulp_sweep.nonfinite_failures``), written as the row's ``nonfinite``; the
     headroom report fails a cell with more of them than its table row accounts for.
+    *bins* is the sweep's per-binade profile (``ulp_sweep.binade_maxima``), written as
+    ``bins``, from which ``ulp_budget_diff.py domains`` re-draws a cell's list offline;
+    *domains* its readings over each entry of the table's list
+    (``ulp_sweep.entry_readings``), written as ``domains``, which the headroom report
+    judges entry by entry.
 
     A failed write warns once and is otherwise ignored: a full disk must not turn into a
     failing test, or hide a failing comparison's summary.
@@ -663,6 +680,13 @@ def _record_ulp_measurement(distance, *, mask, nonfinite: int = 0) -> None:
         # the headroom report.
         "nonfinite": int(nonfinite),
     }
+    if bins is not None:
+        row["bins"] = [[int(b), *counts] for b, counts in sorted(bins.items())]
+    if domains is not None:
+        row["domains"] = [
+            [_json_number(low), _json_number(high), worst, lanes]
+            for low, high, worst, lanes in domains
+        ]
     try:
         with open(_ULP_MEASURE_PATH, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")

@@ -43,12 +43,14 @@ from .chip_architecture import ChipArchitecture
 from .format_config import DataFormat, InputOutputFormat
 from .llk_params import ApproximationMode, DestAccumulation, MathOperation
 from .ulp import (  # FLUSH_SUBNORMAL_OUTPUTS re-exported: the step gates read it here
+    _ULP_PROXY_DTYPES,
     FLUSH_SUBNORMAL_OUTPUTS,
     MANTISSA_BITS_FOR_ULP,
     MAX_MEANINGFUL_ULP,
     has_ulp_gate,
     ulp_dtype,
 )
+from .ulp_domains import DOMAINS_FIELD, Domain, check_domains, contract_of
 from .ulp_provenance import PROVENANCE_FIELDS, check_provenance, load_yaml
 
 #: The architecture every unkeyed budget was measured on. Anywhere else an op resolves
@@ -213,6 +215,13 @@ class AccuracyContract:
     PCC checks skipped; ``Metric.TOLERANCE`` is the historical gate. The two sets of
     fields are mutually exclusive, so a half-converted entry cannot sit in the table
     looking plausible.
+
+    *domains* is the list a row the exhaustive sweep wrote carries (``ulp_domains``):
+    where the op holds which figure. The metric and *max_ulp* are then derived from it
+    -- gated at the largest figure when every entry is within the ceiling, tolerance
+    otherwise -- and a *near_zero_atol* may ride with either, since the entries were
+    measured outside it. The exhaustive sweep gates entry by entry; every other reader
+    takes the derived whole-cell contract.
     """
 
     metric: Metric = Metric.ULP
@@ -220,6 +229,7 @@ class AccuracyContract:
     atol: Optional[float] = None
     rtol: Optional[float] = None
     near_zero_atol: Optional[float] = None
+    domains: Tuple[Domain, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.metric, Metric):
@@ -239,7 +249,9 @@ class AccuracyContract:
                     "a ulp contract replaces the tolerance gate, so atol/rtol would be "
                     "silently ignored; use near_zero_atol for the near-zero floor"
                 )
-        elif self.max_ulp is not None or self.near_zero_atol is not None:
+        elif self.max_ulp is not None or (
+            self.near_zero_atol is not None and not self.domains
+        ):
             raise ValueError(
                 "max_ulp and near_zero_atol belong to the ulp metric; set "
                 f"metric={Metric.ULP} to use them"
@@ -390,8 +402,85 @@ _KEY_FIELDS: Dict[str, str] = {
     "arch": "arch",
 }
 #: The row fields that spell a contract. A ULP row's budget is not among them: it is
-#: the row's ``measured`` figure, read off the provenance fields.
+#: the row's ``measured`` figure, read off the provenance fields -- or, on a row with a
+#: ``domains`` list, derived from the list (:func:`_list_contract`).
 _CONTRACT_FIELDS = frozenset({"metric", "near_zero_atol", "atol", "rtol"})
+
+#: Fields that do not belong beside a ``domains`` list: the list is the whole statement
+#: of what was measured and what gates, so a cell-level figure, metric or sample date
+#: beside it would be a second statement to drift from the first.
+_NOT_BESIDE_DOMAINS = (
+    "measured",
+    "metric",
+    "max_ulp",
+    "sampled",
+    "atol",
+    "rtol",
+    "nonfinite",
+)
+
+
+def usable_budget_ceiling(output_format: DataFormat) -> float:
+    """The largest budget that is still *stronger* than the gate it replaces.
+
+    ``MAX_MEANINGFUL_ULP`` is the wrong bound: ``2**mantissa_bits`` is roughly 100%
+    relative error, so it admits budgets that gate nothing -- and since ``passed_test``
+    returns on the ULP verdict and skips both ``isclose`` and PCC, such a budget *is* the
+    whole gate. Measured, approximate tanh on an fp32 output reaches 655,360 steps, about
+    7.8% relative error, on an op bounded in (-1, 1) -- and that is *after* #57179 traded
+    the 3-segment SFPLUT for a 6-entry table; the same measurement was 2,949,120 steps,
+    about 35%, before it. A bound that admits either is not a gate.
+
+    The real bound is the ``rtol`` half of the ``isclose`` this replaces, itself a step
+    budget at large magnitude, rounded *down* to a whole step because a budget is one:
+    419,430 steps for fp32, 51 for fp16, 6 for bf16, 25 for Bfp8_b. Down, not up: a
+    step is widest relative to the value at the bottom of a binade, where bf16's 6.4
+    lets ``isclose`` accept ``128 -> 134`` and refuse ``128 -> 135``, so a 7-step budget
+    would pass what the tolerance it displaced rejected, with no PCC behind it.
+    ``passed_test`` warns past the unrounded figure at runtime; no row here may cross it.
+    """
+    from .utils import tolerances
+
+    dtype = ulp_dtype(output_format)
+    by_rtol = tolerances[output_format].rtol * (1 << MANTISSA_BITS_FOR_ULP[dtype])
+    return float(math.floor(min(by_rtol, float(MAX_MEANINGFUL_ULP[dtype]))))
+
+
+def _list_contract(where: str, row: Dict[str, Any]) -> AccuracyContract:
+    """A row with a ``domains`` list as the contract it implies (``ulp_domains``). The
+    row pins the formats it was measured on and names its run; the metric and the
+    whole-cell figure come from the entries."""
+    for field in _NOT_BESIDE_DOMAINS:
+        if field in row:
+            raise ValueError(
+                f"{where}: `{field}` does not belong beside `{DOMAINS_FIELD}`; the list "
+                "is the whole statement"
+            )
+    if row.get("in") is None or row.get("out") is None:
+        raise ValueError(
+            f"{where}: a `{DOMAINS_FIELD}` list needs the row to pin `in` and `out`, "
+            "the formats it was measured on"
+        )
+    if "run" not in row:
+        raise ValueError(
+            f"{where}: a `{DOMAINS_FIELD}` list names the `run` that measured it"
+        )
+    check_provenance(where, row, tolerance=True)  # the date's own checks
+    out_fmt = _enum_member(DataFormat, row["out"], where)
+    if not has_ulp_gate(out_fmt) or out_fmt in _ULP_PROXY_DTYPES:
+        raise ValueError(
+            f"{where}: {out_fmt.name} has no per-element ULP, so no `{DOMAINS_FIELD}`"
+        )
+    domains = check_domains(where, row[DOMAINS_FIELD])
+    metric, figure = contract_of(domains, usable_budget_ceiling(out_fmt))
+    if row.get("near_zero_atol") is not None:
+        _check_number("near_zero_atol", row["near_zero_atol"])
+    return AccuracyContract(
+        metric=Metric(metric),
+        max_ulp=figure if metric == "ulp" else None,
+        near_zero_atol=row.get("near_zero_atol"),
+        domains=domains,
+    )
 
 
 def _enum_member(enum_cls: Type[E], value: Any, where: str) -> E:
@@ -432,7 +521,13 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
 def _row_to_entry(
     where: str, row: Dict[str, Any]
 ) -> Tuple[BudgetKey, AccuracyContract]:
-    unknown = set(row) - set(_KEY_FIELDS) - _CONTRACT_FIELDS - set(PROVENANCE_FIELDS)
+    unknown = (
+        set(row)
+        - set(_KEY_FIELDS)
+        - _CONTRACT_FIELDS
+        - set(PROVENANCE_FIELDS)
+        - {DOMAINS_FIELD}
+    )
     if unknown:
         raise ValueError(f"{where}: unknown field(s) {sorted(unknown)}")
     key = BudgetKey(
@@ -442,6 +537,8 @@ def _row_to_entry(
             if short in row
         }
     )
+    if DOMAINS_FIELD in row:
+        return key, _list_contract(where, row)
     contract = {field: row[field] for field in _CONTRACT_FIELDS if field in row}
     metric = _enum_member(Metric, contract.pop("metric", "ulp"), where)
     # The resolved metric, not the raw scalar: `metric: TOLERANCE` names the member too.
@@ -651,35 +748,45 @@ def assert_against_contract(
         raise AssertionError("Assert against golden failed")
 
 
+def domains_of(
+    op: MathOperation,
+    *,
+    output_format: DataFormat,
+    arch: ChipArchitecture,
+    input_format: Optional[DataFormat] = None,
+    approx_mode: Optional[ApproximationMode] = None,
+    dest_acc: Optional[DestAccumulation] = None,
+) -> Tuple[Tuple[Domain, ...], Optional[float]]:
+    """The ``domains`` list one variant is held to, with the row's near-zero floor, or
+    ``((), None)``: an op with no rows, a row without a list, an output with no
+    per-element ULP, or an architecture the row does not bind on (an unkeyed row is a
+    :data:`MEASURED_ARCH` measurement, as for :func:`accuracy_contract`).
+
+    Pure, unlike :func:`accuracy_contract`: it publishes no query, so the sweep driver
+    calls it beside its one lookup without making that lookup ambiguous.
+    """
+    table = _SFPU_ACCURACY_BUDGET.get(op)
+    if table is None or not has_ulp_gate(output_format):
+        return (), None
+    query = BudgetKey(
+        approx_mode=approx_mode,
+        input_format=input_format,
+        output_format=output_format,
+        dest_acc=dest_acc,
+        arch=arch,
+    )
+    found = _winner(table, query, op.name)
+    if found is None:
+        return (), None
+    key, contract = found
+    if not contract.domains or not (arch == MEASURED_ARCH or key.arch is not None):
+        return (), None
+    return contract.domains, contract.near_zero_atol
+
+
 def enrolled_ops() -> Tuple[MathOperation, ...]:
     """Every op with a declared contract, in name order. For reporting and tests."""
     return tuple(sorted(_SFPU_ACCURACY_BUDGET, key=lambda op: op.name))
-
-
-def usable_budget_ceiling(output_format: DataFormat) -> float:
-    """The largest budget that is still *stronger* than the gate it replaces.
-
-    ``MAX_MEANINGFUL_ULP`` is the wrong bound: ``2**mantissa_bits`` is roughly 100%
-    relative error, so it admits budgets that gate nothing -- and since ``passed_test``
-    returns on the ULP verdict and skips both ``isclose`` and PCC, such a budget *is* the
-    whole gate. Measured, approximate tanh on an fp32 output reaches 655,360 steps, about
-    7.8% relative error, on an op bounded in (-1, 1) -- and that is *after* #57179 traded
-    the 3-segment SFPLUT for a 6-entry table; the same measurement was 2,949,120 steps,
-    about 35%, before it. A bound that admits either is not a gate.
-
-    The real bound is the ``rtol`` half of the ``isclose`` this replaces, itself a step
-    budget at large magnitude, rounded *down* to a whole step because a budget is one:
-    419,430 steps for fp32, 51 for fp16, 6 for bf16, 25 for Bfp8_b. Down, not up: a
-    step is widest relative to the value at the bottom of a binade, where bf16's 6.4
-    lets ``isclose`` accept ``128 -> 134`` and refuse ``128 -> 135``, so a 7-step budget
-    would pass what the tolerance it displaced rejected, with no PCC behind it.
-    ``passed_test`` warns past the unrounded figure at runtime; no row here may cross it.
-    """
-    from .utils import tolerances
-
-    dtype = ulp_dtype(output_format)
-    by_rtol = tolerances[output_format].rtol * (1 << MANTISSA_BITS_FOR_ULP[dtype])
-    return float(math.floor(min(by_rtol, float(MAX_MEANINGFUL_ULP[dtype]))))
 
 
 def validate_registry() -> None:

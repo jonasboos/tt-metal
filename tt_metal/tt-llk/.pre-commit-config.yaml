@@ -47,6 +47,10 @@ repos:
     - id: end-of-file-fixer
     - id: check-added-large-files
       args: ["--maxkb=500"]
+      # The SFPU accuracy table carries a `domains` list on every row the exhaustive
+      # sweep writes (tests/SFPU_ULP.md); test_the_table_fits_the_repos_file_size_limit
+      # holds it to its own ceiling.
+      exclude: (^|/)tests/python_tests/helpers/sfpu_accuracy_budget\.yaml$
     - id: check-merge-conflict
     - id: check-executables-have-shebangs
     - id: check-docstring-first

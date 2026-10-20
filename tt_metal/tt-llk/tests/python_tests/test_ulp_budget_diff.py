@@ -19,9 +19,12 @@ from helpers.ulp_budget_diff import (
     _MAX_ROWS,
     CONTRACT_FIELDS,
     KEY_FIELDS,
+    LIST_OUTPUTS,
+    NOT_BESIDE_DOMAINS,
     RECORDED_SKIP,
     ULP_GATED_OUTPUTS,
     DuplicateRow,
+    _entry_readings,
     _gates,
     _measured_cells,
     _nonfinite_cells,
@@ -784,18 +787,18 @@ def test_a_tolerance_cell_with_no_recorded_figure_is_counted_not_passed_silently
 # ── The slim runner, and the tie-back to the real loader ──────────────────────
 
 
-#: The modules the slim runner loads, by path: the tool, and the one sibling it reads
-#: the table through.
-_SLIM_MODULES = ("ulp_budget_diff.py", "ulp_provenance.py")
-_SLIM_SIBLINGS = {"ulp_provenance"}
+#: The modules the slim runner loads, by path: the tool, the sibling it reads the
+#: table through, and the one that holds the `domains` rule.
+_SLIM_MODULES = ("ulp_budget_diff.py", "ulp_provenance.py", "ulp_domains.py")
+_SLIM_SIBLINGS = {"ulp_provenance", "ulp_domains"}
 
 
 @pytest.mark.parametrize("module", _SLIM_MODULES)
 def test_the_tool_imports_nothing_but_the_standard_library_and_yaml(module):
     """The PR check runs on a slim runner: no torch, no ttexalens, no LLK venv. Read off
     each module's own AST: the import list is the actual property, and a subprocess
-    would prove it for one environment only. The one sibling allowed is
-    ``ulp_provenance``, itself held to the same rule."""
+    would prove it for one environment only. The siblings allowed are
+    ``ulp_provenance`` and ``ulp_domains``, themselves held to the same rule."""
     tool = Path(__file__).parent / "helpers" / module
     roots = set()
     for node in ast.walk(ast.parse(tool.read_text(encoding="utf-8"))):
@@ -1451,3 +1454,222 @@ def test_a_budget_raised_inside_a_root_merge_is_refused_not_compared_clean(tmp_p
         "--allow-raises",
     ]
     assert main(argv) == 2
+
+
+# ── Rows with a `domains` list ───────────────────────────────────────────────
+
+_TANH_LIST = (
+    '{in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-20, domains: '
+    "[{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]}"
+)
+_TANH_PLAIN = '{in: Float16_b, out: Float16_b, dest: "No", metric: tolerance, measured: 10, run: 2026-01-01}'
+
+
+def _tanh(row):
+    return parse_table("Tanh:\n  - " + row + "\n")
+
+
+def _segment_kinds(base, head):
+    return [
+        (c.kind, c.segment, c.held_before, c.held_after) for c in compare(base, head)
+    ]
+
+
+def test_a_plain_row_turned_into_a_list_is_judged_segment_by_segment():
+    """The tolerance cell gains a gate on the lanes outside [-1, 1), and nothing changes
+    inside it, where the figure is the same measurement."""
+    assert _segment_kinds(_tanh(_TANH_PLAIN), _tanh(_TANH_LIST)) == [
+        ("gated", "[-.inf, -1)", "tolerance (max 10)", "3"),
+        ("gated", "[1, .inf)", "tolerance (max 10)", "3"),
+    ]
+
+
+def test_an_entry_raised_is_a_raise_for_its_lanes_only():
+    raised = _TANH_LIST.replace("high: -1, ulp: 3", "high: -1, ulp: 4").replace(
+        "2026-10-20", "2026-10-21"
+    )
+    (change,) = compare(_tanh(_TANH_LIST), _tanh(raised))
+    assert (change.kind, change.segment, change.is_regression) == (
+        "raised",
+        "[-.inf, -1)",
+        True,
+    )
+    assert change.remeasured  # the run date moved with it
+    assert "x in [-.inf, -1)" in render_budget_diff([change])
+
+
+def test_a_list_redrawn_with_the_same_figures_is_no_change():
+    split = _TANH_LIST.replace(
+        "{low: -1, high: 1, ulp: 10}",
+        "{low: -1, high: 0, ulp: 10}, {low: 0, high: 1, ulp: 10}",
+    )
+    assert compare(_tanh(_TANH_LIST), _tanh(split)) == []
+
+
+def test_a_list_replaced_by_a_looser_one_loses_the_gate_where_it_loosens():
+    """An entry past the ceiling gates nothing: its lanes are ungated, and reported as
+    exactly those lanes."""
+    looser = _TANH_LIST.replace(
+        "{low: 1, high: .inf, ulp: 3}", "{low: 1, high: .inf, ulp: 9}"
+    )
+    assert _segment_kinds(_tanh(_TANH_LIST), _tanh(looser)) == [
+        ("ungated", "[1, .inf)", "3", "tolerance (max 9)")
+    ]
+    dropped = _TANH_LIST.replace(
+        "{low: 1, high: .inf, ulp: 3}", "{low: 1, high: .inf, ulp: null}"
+    )
+    assert _segment_kinds(_tanh(_TANH_LIST), _tanh(dropped)) == [
+        ("ungated", "[1, .inf)", "3", "unranked")
+    ]
+
+
+@pytest.mark.parametrize(
+    "row, problem",
+    [
+        (
+            _TANH_LIST.replace("run: 2026-10-20", "measured: 10, run: 2026-10-20"),
+            "does not belong beside",
+        ),
+        (
+            _TANH_LIST.replace("run: 2026-10-20", "metric: tolerance, run: 2026-10-20"),
+            "does not belong beside",
+        ),
+        (
+            _TANH_LIST.replace("run: 2026-10-20", "sampled: 2026-10-20"),
+            "does not belong beside",
+        ),
+        (_TANH_LIST.replace("run: 2026-10-20, ", ""), "names the `run`"),
+        (_TANH_LIST.replace("in: Float16_b, ", ""), "pin `in` and `out`"),
+        (_TANH_LIST.replace("out: Float16_b", "out: Bfp8_b"), "no per-element ULP"),
+        (
+            _TANH_LIST.replace(
+                "high: -1, ulp: 3}, {low: -1", "high: -3, ulp: 3}, {low: -3"
+            ),
+            "0 or a power of two",
+        ),
+        (_TANH_LIST.replace("low: -.inf, ", "low: -8, "), "cover"),
+    ],
+    ids=[
+        "measured-beside",
+        "metric-beside",
+        "sampled",
+        "no-run",
+        "no-in",
+        "block-output",
+        "bad-edge",
+        "not-whole",
+    ],
+)
+def test_a_list_row_the_registry_refuses_is_refused_here(row, problem):
+    with _refuses(ValueError) as caught:
+        _tanh(row)
+    assert problem in str(caught.value)
+
+
+def test_the_headroom_report_judges_each_entry_of_a_list():
+    """The recorder writes what it measured over each entry of the table's list; a
+    gated entry over its figure is over budget, a better reading is a re-emit's to
+    tighten, a null entry some lane answers in is listed, and the cell-level `max` is
+    not what a list row is judged by."""
+    table = _tanh(
+        _TANH_LIST.replace(
+            "{low: 1, high: .inf, ulp: 3}", "{low: 1, high: .inf, ulp: null}"
+        )
+    )
+    rows = [
+        {
+            "op": "Tanh",
+            "in": "Float16_b",
+            "out": "Float16_b",
+            "approx": "No",
+            "dest": "No",
+            "max": 10,
+            "lanes": 65025,
+            "nonfinite": 0,
+            "domains": [
+                ["-inf", -1.0, 5, 16000],
+                [-1.0, 1.0, 9, 33000],
+                [1.0, "inf", 2, 70],
+            ],
+        }
+    ]
+    report, regressions = render_headroom(
+        table, _measured_cells(rows), entries=_entry_readings(rows)
+    )
+    assert regressions == 1
+    assert "x in [-.inf, -1)` | 5 | 3 | over budget |" in report
+    assert "x in [-1, 1)` | 9 | 10 | re-emit tightens |" in report
+    assert "x in [1, .inf)` | 2 | unranked | now answers |" in report
+    assert "3 list entries judged" in report
+    # A handful of stray lanes in a null entry is what the rule leaves unranked.
+    rows[0]["domains"][2][3] = 7
+    report, _ = render_headroom(
+        table, _measured_cells(rows), entries=_entry_readings(rows)
+    )
+    assert "now answers" not in report
+    # With the binade profile the rule is applied exactly: 70 lanes spread over five
+    # binades at 14 each rank none of them; 16 in one binade does.
+    rows[0]["domains"][2][3] = 70
+    rows[0]["bins"] = [[150 + k, 128, 14, 0] for k in range(5)]
+    report, _ = render_headroom(
+        table, _measured_cells(rows), entries=_entry_readings(rows)
+    )
+    assert "now answers" not in report
+    rows[0]["bins"][2][2] = 16
+    report, _ = render_headroom(
+        table, _measured_cells(rows), entries=_entry_readings(rows)
+    )
+    assert "now answers" in report
+    # The same readings against a list the run did not read: nothing is judged.
+    moved = _tanh(
+        _TANH_LIST.replace("high: -1, ulp: 3}, {low: -1", "high: -2, ulp: 3}, {low: -2")
+    )
+    report, regressions = render_headroom(
+        moved, _measured_cells(rows), entries=_entry_readings(rows)
+    )
+    assert regressions == 0 and "not judged" in report
+
+
+def test_the_domains_view_redraws_a_list_from_the_recorded_profile(tmp_path, capsys):
+    """`bins` is the per-binade profile the emitter drew the list from; the view runs
+    the same rule on it, with no device, beside what the table holds."""
+    import json
+
+    bins = []
+    for k in range(-126, 128):
+        for sign in (1, -1):
+            bins.append([sign * (k + 150), 128, 128, 10 if k < 0 else 3])
+    bins.append([0, 1, 1, 0])
+    row = {
+        "op": "Tanh",
+        "in": "Float16_b",
+        "out": "Float16_b",
+        "approx": "No",
+        "dest": "No",
+        "max": 10,
+        "lanes": 65025,
+        "nonfinite": 0,
+        "bins": bins,
+    }
+    measured = _write(tmp_path, "m.jsonl", json.dumps(row) + "\n")
+    table = _write(tmp_path, "t.yaml", "Tanh:\n  - " + _TANH_LIST + "\n")
+    assert (
+        main(["domains", "--measured", measured, "--table", table, "--op", "Tanh"]) == 0
+    )
+    out = capsys.readouterr().out
+    assert (
+        "[{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]"
+        in out
+    )
+    assert "table: [{low: -.inf, high: -1, ulp: 3}" in out
+
+
+def test_the_list_rules_are_the_registrys():
+    from helpers.format_config import DataFormat
+    from helpers.sfpu_accuracy_budget import _NOT_BESIDE_DOMAINS
+    from helpers.ulp import _ULP_PROXY_DTYPES, has_ulp_gate
+
+    assert NOT_BESIDE_DOMAINS == _NOT_BESIDE_DOMAINS
+    assert LIST_OUTPUTS == {
+        f.name for f in DataFormat if has_ulp_gate(f) and f not in _ULP_PROXY_DTYPES
+    }

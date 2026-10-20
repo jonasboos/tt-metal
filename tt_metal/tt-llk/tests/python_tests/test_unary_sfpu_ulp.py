@@ -54,6 +54,8 @@ from helpers.sfpu_accuracy_budget import (
     MEASURED_ARCH,
     Metric,
     accuracy_contract,
+    domains_of,
+    usable_budget_ceiling,
 )
 from helpers.sfpu_domains import (
     _UNARY_OPS_NOT_SWEPT,
@@ -73,14 +75,23 @@ from helpers.test_variant_parameters import (
     TILE_COUNT,
     generate_input_dim,
 )
-from helpers.ulp import ulp_distance, ulp_stats
+from helpers.ulp import _ULP_PROXY_DTYPES, ulp_distance, ulp_stats
 from helpers.ulp_budget_diff import RECORDED_SKIP
+from helpers.ulp_domains import number_text, partition
 from helpers.ulp_sweep import (
+    band_mask,
+    binade_maxima,
+    domain_figures,
+    entry_readings,
+    floor_covered,
+    floored_distance,
     golden_input,
     near_zero_floor,
     nonfinite_failures,
     nonfinite_reason,
+    padding_lanes,
     ranked_mask,
+    received_inputs,
     stimuli_format_for,
     sweep_cells,
     sweep_spec,
@@ -214,24 +225,38 @@ def _sweep_ops():
 )
 @pytest.mark.parametrize("mathop", _sweep_ops(), ids=lambda op: op.name)
 def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
-    """Every non-special value of a 16-bit input format, or a stride of Float32. A gated
-    cell is held to its step budget here; a tolerance cell is measured and recorded, and
-    the headroom report holds it to the figure its row records."""
+    """Every normal value of a 16-bit input format, or a stride of Float32. A row with a
+    ``domains`` list is held entry by entry: each entry within the output's ceiling to
+    its figure (``ulp_domains``). A plain gated cell is held to its step budget; a
+    tolerance cell or entry is measured and recorded, and the headroom report holds it
+    to the figure its row records."""
     formats = InputOutputFormat(in_fmt, out_fmt)
     cell = (
         f"{mathop.name} {in_fmt.name}->{out_fmt.name} approx={approx_mode.name} "
         f"dest_acc={dest_acc.name}"
     )
+    arch = get_chip_architecture()
     contract = accuracy_contract(
         mathop,
         output_format=out_fmt,
         input_format=in_fmt,
         approx_mode=approx_mode,
         dest_acc=dest_acc,
-        arch=get_chip_architecture(),
+        arch=arch,
     )
-    # A tolerance cell is measured too: the headroom report holds it to its row's figure.
-    gated = contract.metric == Metric.ULP
+    # The row's list, if it has one: then the entries are the verdict, and the cell is
+    # gated wherever an entry is. A tolerance cell is measured too: the headroom report
+    # holds it, entry by entry where it has them, to its row's figures.
+    domains, floor_atol = domains_of(
+        mathop,
+        output_format=out_fmt,
+        input_format=in_fmt,
+        approx_mode=approx_mode,
+        dest_acc=dest_acc,
+        arch=arch,
+    )
+    ceiling = usable_budget_ceiling(out_fmt)
+    gated = contract.metric == Metric.ULP or any(d.gated(ceiling) for d in domains)
 
     # No OverflowError skip. cosh/sinh were the last goldens that could raise on a finite
     # input; they go through torch now. Some still call `math.*` (atan, asinh, the tanh
@@ -310,39 +335,138 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
             pytest.skip(f"{cell}: {RECORDED_SKIP} -- not measurable: {unmeasurable}")
         raise AssertionError(f"{cell}: {unmeasurable}")
 
-    if ulp_sweep.EMIT or not gated:
-        # Measured, not gated. The JSONL row is what `--ulp-measure` would have written
-        # from inside passed_test, which this branch returns before; a tolerance cell is
-        # held against its row's `measured` figure by the headroom report.
-        _record_ulp_measurement(distance, mask=mask)
-        if ulp_sweep.EMIT:
-            # A cell that only a near-zero lane demotes is recorded with the floor that
-            # covers it, and the emitter enrols it on the lanes outside that floor.
-            floor = near_zero_floor(golden, result, distance, mask, out_fmt)
-            ulp_sweep.record(mathop.name, key, int(stats["max"]), floor=floor)
-            return
-        # A skip, not a pass: nothing here judged the cell. Without --ulp-measure there
-        # is no record for the headroom report either, and a regression would show green.
-        pytest.skip(
-            f"{cell}: {RECORDED_SKIP} -- on the tolerance metric; measured max "
-            f"{int(stats['max'])} ULP over {lanes} lanes. The headroom report "
-            "(ulp_budget_diff.py headroom over --ulp-measure) holds it to its row's "
-            "recorded figure."
-        )
+    # Where each lane's input sits, as the kernel received it, for the domains; and the
+    # lanes the near-zero floor judges on absolute error, which the entries leave out
+    # as the cell's residual does.
+    x = received_inputs(src, in_fmt, out_fmt, dest_acc).to(torch.float64)
+    present = ~padding_lanes(src, in_fmt)
+    per_element = out_fmt not in _ULP_PROXY_DTYPES  # a block output gets no list
 
-    # The contract's own verdict rather than `stats["max"]`, so a `near_zero_atol` floor
-    # (Erfinv Float16_b->Float16_b reads 14704 steps raw, and 2 with it) is honoured.
-    # That makes `stats` the raw maximum, which can be a lane the floor rescued: the
-    # failing lanes are the ones passed_test logs.
-    assert passed_test(
-        golden,
-        result,
-        out_fmt,
+    if ulp_sweep.EMIT:
+        # A cell that only a near-zero lane demotes is recorded with the floor that
+        # covers it, and the emitter enrols it on the lanes outside that floor; the list
+        # is drawn on those same lanes, so an entry's figure is the cell's residual over
+        # fewer lanes.
+        floor = near_zero_floor(golden, result, distance, mask, out_fmt)
+        covered = floor_covered(golden, result, mask, floor[1] if floor else None)
+        judged = mask & ~covered
+        drawn, bins = (), None
+        if per_element:
+            # The profile counts a lane the floor covers as ranked at 0 steps: it is
+            # held, by the floor, so it draws no edge of its own, and the entry it falls
+            # in is figured over the lanes outside the floor, as the cell is.
+            bins = binade_maxima(x, floored_distance(distance, covered), mask, present)
+            drawn = domain_figures(partition(bins, ceiling), x, distance, mask, judged)
+        _record_ulp_measurement(
+            distance,
+            mask=mask,
+            bins=bins,
+            domains=entry_readings(drawn, x, distance, mask, judged) if drawn else None,
+        )
+        ulp_sweep.record(
+            mathop.name, key, int(stats["max"]), floor=floor, domains=drawn
+        )
+        return
+
+    if not domains:
+        if not gated:
+            # Measured, not gated. The JSONL row is what `--ulp-measure` would have
+            # written from inside passed_test, which this branch returns before; a
+            # tolerance cell is held against its row's `measured` figure by the headroom
+            # report.
+            _record_ulp_measurement(distance, mask=mask)
+            # A skip, not a pass: nothing here judged the cell. Without --ulp-measure
+            # there is no record for the headroom report either, and a regression would
+            # show green.
+            pytest.skip(
+                f"{cell}: {RECORDED_SKIP} -- on the tolerance metric; measured max "
+                f"{int(stats['max'])} ULP over {lanes} lanes. The headroom report "
+                "(ulp_budget_diff.py headroom over --ulp-measure) holds it to its row's "
+                "recorded figure."
+            )
+        # The contract's own verdict rather than `stats["max"]`, so a `near_zero_atol`
+        # floor (Erfinv Float16_b->Float16_b reads 14704 steps raw, and 2 with it) is
+        # honoured. That makes `stats` the raw maximum, which can be a lane the floor
+        # rescued: the failing lanes are the ones passed_test logs.
+        assert passed_test(
+            golden,
+            result,
+            out_fmt,
+            mask=mask,
+            **contract.passed_test_kwargs(flush_subnormals=_FLUSH_SUBNORMALS),
+        ), (
+            f"{cell}: failed a {contract.max_ulp}-step budget over {lanes} swept lanes; "
+            "the failing lanes are in the ULP-budget log above. Raw maximum before any "
+            f"near_zero_atol floor: {stats['max']} ULP at flat index "
+            f"{stats['worst_index']}."
+        )
+        return
+
+    # A row with a list: the entries are the verdict (ulp_domains). Record the cell
+    # once, with its reading over every entry -- which consumes the one lookup above, so
+    # the comparisons below record nothing of their own -- then hold each gateable entry
+    # to its figure over the lanes outside the floor, and the ranked lanes a null entry
+    # leaves unjudged to the row's largest.
+    covered = floor_covered(golden, result, mask, floor_atol)
+    judged = mask & ~covered
+    readings = entry_readings(domains, x, distance, mask, judged)
+    _record_ulp_measurement(
+        distance,
         mask=mask,
-        **contract.passed_test_kwargs(flush_subnormals=_FLUSH_SUBNORMALS),
-    ), (
-        f"{cell}: failed a {contract.max_ulp}-step budget over {lanes} swept lanes; "
-        "the failing lanes are in the ULP-budget log above. Raw maximum before any "
-        f"near_zero_atol floor: {stats['max']} ULP at flat index "
-        f"{stats['worst_index']}."
+        bins=binade_maxima(x, floored_distance(distance, covered), mask, present),
+        domains=readings,
+    )
+    if not gated:
+        pytest.skip(
+            f"{cell}: {RECORDED_SKIP} -- every entry is past the ceiling; measured max "
+            f"{int(stats['max'])} ULP over {lanes} lanes. The headroom report holds each "
+            "entry to its figure."
+        )
+    largest = max(d.ulp for d in domains if d.ulp is not None)
+    failed = []
+    inside = torch.zeros_like(mask)
+    for entry, reading in zip(domains, readings):
+        if entry.ulp is None:
+            continue
+        # Exactly the lanes the emitter figured the entry on: ranked, outside the
+        # cell-wide floor. The floor is not applied again here -- scoped to one entry's
+        # lanes its band would differ from the emitter's. A covered lane is one whose
+        # absolute error is within the floor today; one that drifted out of it is in
+        # `judged`, and held to the figure by steps like any other.
+        band = band_mask(entry, x, judged)
+        inside |= band
+        if entry.ulp > ceiling or not bool(band.any()):
+            continue  # measured, not gated; or every lane of it held by the floor
+        if not passed_test(
+            golden,
+            result,
+            out_fmt,
+            mask=band,
+            max_ulp=entry.ulp,
+            flush_subnormals=_FLUSH_SUBNORMALS,
+        ):
+            failed.append(
+                f"x in [{number_text(entry.low)}, {number_text(entry.high)}): worst "
+                f"lane {reading[2]} over its figure {entry.ulp}"
+            )
+    leftover = judged & ~inside
+    if (
+        bool(leftover.any())
+        and largest <= ceiling
+        and not passed_test(
+            golden,
+            result,
+            out_fmt,
+            mask=leftover,
+            max_ulp=largest,
+            flush_subnormals=_FLUSH_SUBNORMALS,
+        )
+    ):
+        failed.append(
+            f"{int(leftover.sum())} ranked lane(s) in a null entry, over the row's "
+            f"largest figure {largest}"
+        )
+    assert not failed, (
+        f"{cell}: " + "; ".join(failed) + ". The failing lanes are in the ULP-budget "
+        "log above."
     )

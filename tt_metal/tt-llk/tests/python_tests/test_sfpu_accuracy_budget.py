@@ -47,6 +47,7 @@ from helpers.sfpu_accuracy_budget import (
     _winner,
     accuracy_contract,
     assert_against_contract,
+    domains_of,
     enrolled_ops,
     resolve_contract,
     usable_budget_ceiling,
@@ -1759,7 +1760,7 @@ def test_a_demoted_row_measured_past_the_ceiling():
     wrong = []
     for row in BudgetTable.load(_TABLE_PATH).rows:
         p, fields = row.provenance, row.pinned
-        if row.metric != "tolerance" or not p.swept or p.unmeasurable:
+        if row.metric != "tolerance" or not p.swept or row.unmeasurable or row.domains:
             continue
         out_fmt = DataFormat[fields["out"]]
         if not has_ulp_gate(out_fmt) or out_fmt in _ULP_PROXY_DTYPES:
@@ -1939,7 +1940,7 @@ def _not_measurable_cells(path=_TABLE_PATH):
     on an output a step budget could gate."""
     cells = []
     for row in BudgetTable.load(path).rows:
-        if not row.provenance.unmeasurable:
+        if not row.unmeasurable:
             continue
         fields = row.pinned
         out_fmt = DataFormat[fields["out"]]
@@ -1959,19 +1960,21 @@ def _not_measurable_cells(path=_TABLE_PATH):
 
 #: The repo's `check-large-files` pre-commit hook (scripts/check_file_size.py): a file of
 #: more than this many KB, rounded up, fails it, and the table has no exclude there.
-_REPO_FILE_SIZE_LIMIT_KB = 500
+#: The table's own ceiling. The repo's check-large-files hook (500 KB) excludes the
+#: table since every row the sweep writes carries its `domains` list, which took it past
+#: that; this is the limit that replaces the hook's for the one file.
+_TABLE_SIZE_LIMIT_KB = 1024
 
 
-def test_the_table_fits_the_repos_file_size_limit():
-    """The hook only runs in pre-commit, so a re-emit that grows the table past it is
-    otherwise found by CI. It grows with every op enrolled and every not-measurable
-    verdict (``ulp_sweep.NAMED_LANES`` lanes each): trim a recurring note before raising
-    anything, or give the hook a justified exclude."""
+def test_the_table_fits_its_own_size_limit():
+    """The hook does not look at the table, so nothing else holds its growth: it grows
+    with every op enrolled, every entry a list gains and every not-measurable verdict
+    (``ulp_sweep.NAMED_LANES`` lanes each). Trim a recurring note before raising this.
+    """
     kb = math.ceil(_TABLE_PATH.stat().st_size / 1024)
-    assert kb <= _REPO_FILE_SIZE_LIMIT_KB, (
-        f"{_TABLE_PATH.name} is {kb} KB, past the {_REPO_FILE_SIZE_LIMIT_KB} KB "
-        "check-large-files limit"
-    )
+    assert (
+        kb <= _TABLE_SIZE_LIMIT_KB
+    ), f"{_TABLE_PATH.name} is {kb} KB, past its {_TABLE_SIZE_LIMIT_KB} KB limit"
 
 
 #: Rows whose every claimed lane disagreed with the golden about being finite: there
@@ -2129,3 +2132,107 @@ def test_every_unary_op_is_enrolled_or_excused():
         + ". Measure it with --ulp-emit (add the op's key line to the table first), or "
         "add it to _UNARY_OPS_NOT_SWEPT with why it cannot be swept."
     )
+
+
+# ── Rows with a `domains` list ───────────────────────────────────────────────
+
+_TANH_LIST = (
+    'Tanh:\n  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-20, domains: '
+    "[{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, "
+    "{low: 1, high: .inf, ulp: 3}]}\n"
+)
+
+
+def test_a_list_row_loads_as_the_contract_its_entries_imply(tmp_path):
+    """No cell-level figure or metric: the list is the statement, and the whole-cell
+    contract is derived from it -- tolerance here, since 10 is past bf16's ceiling of
+    6, and gated at the largest figure once every entry fits."""
+    from helpers.ulp_domains import Domain
+
+    (contract,) = _table(tmp_path, _TANH_LIST)[MathOperation.Tanh].values()
+    assert contract.metric is Metric.TOLERANCE and contract.max_ulp is None
+    assert contract.domains == (
+        Domain(-math.inf, -1, 3),
+        Domain(-1, 1, 10),
+        Domain(1, math.inf, 3),
+    )
+    fits = _TANH_LIST.replace("ulp: 10", "ulp: 5")
+    (contract,) = _table(tmp_path, fits)[MathOperation.Tanh].values()
+    assert (contract.metric, contract.max_ulp) == (Metric.ULP, 5)
+    floored = _TANH_LIST.replace("run:", "near_zero_atol: 1.0e-07, run:")
+    (contract,) = _table(tmp_path, floored)[MathOperation.Tanh].values()
+    assert contract.metric is Metric.TOLERANCE and contract.near_zero_atol == 1e-7
+
+
+def test_a_floor_rides_with_a_list_on_either_metric_but_not_alone():
+    from helpers.ulp_domains import Domain
+
+    entries = (Domain(-math.inf, math.inf, 100),)
+    AccuracyContract(metric=Metric.TOLERANCE, near_zero_atol=1e-7, domains=entries)
+    with _refuses("belong to the ulp metric"):
+        AccuracyContract(metric=Metric.TOLERANCE, near_zero_atol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "edit, problem",
+    [
+        (("run:", "measured: 10, run:"), "does not belong beside"),
+        (("run:", "metric: tolerance, run:"), "does not belong beside"),
+        (("run: 2026-10-20", "sampled: 2026-10-20"), "does not belong beside"),
+        (("run: 2026-10-20, ", ""), "names the `run`"),
+        (("in: Float16_b, ", ""), "pin `in` and `out`"),
+        (("out: Float16_b", "out: Bfp8_b"), "no per-element ULP"),
+        (
+            ("high: -1, ulp: 3}, {low: -1", "high: -3, ulp: 3}, {low: -3"),
+            "0 or a power of two",
+        ),
+        (("ulp: 10", "ulp: 1.5"), "integer >= 0 or null"),
+    ],
+    ids=[
+        "measured-beside",
+        "metric-beside",
+        "sampled",
+        "no-run",
+        "no-in",
+        "block-output",
+        "bad-edge",
+        "ulp-float",
+    ],
+)
+def test_a_list_row_with_a_second_statement_beside_it_is_refused(
+    tmp_path, edit, problem
+):
+    with _refuses(problem):
+        _table(tmp_path, _TANH_LIST.replace(*edit))
+
+
+def test_domains_of_hands_the_sweep_driver_the_list_and_the_floor(
+    tmp_path, monkeypatch
+):
+    """Pure: beside the driver's one `accuracy_contract` lookup it must not publish a
+    query of its own, or the recorder would drop that test's reading. And a Wormhole
+    list binds nowhere else, as a Wormhole figure does not."""
+    import helpers.sfpu_accuracy_budget as budget
+
+    table = _table(
+        tmp_path, _TANH_LIST.replace("run:", "near_zero_atol: 1.0e-07, run:")
+    )
+    monkeypatch.setattr(budget, "_SFPU_ACCURACY_BUDGET", table)
+    monkeypatch.setattr(budget, "LAST_QUERY", None)
+    query = dict(
+        output_format=DataFormat.Float16_b,
+        input_format=DataFormat.Float16_b,
+        dest_acc=DestAccumulation.No,
+        approx_mode=ApproximationMode.No,
+    )
+    domains, floor = domains_of(MathOperation.Tanh, arch=MEASURED_ARCH, **query)
+    assert len(domains) == 3 and floor == 1e-7
+    assert budget.LAST_QUERY is None
+    for arch in UNSWEPT_ARCHS:
+        assert domains_of(MathOperation.Tanh, arch=arch, **query) == ((), None)
+    assert domains_of(MathOperation.Abs, arch=MEASURED_ARCH, **query) == ((), None)
+    assert domains_of(
+        MathOperation.Tanh,
+        arch=MEASURED_ARCH,
+        **{**query, "output_format": DataFormat.Bfp4_b},
+    ) == ((), None)

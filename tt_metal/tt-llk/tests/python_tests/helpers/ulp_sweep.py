@@ -28,6 +28,7 @@ import torch
 import yaml
 from helpers.format_config import DataFormat
 from helpers.stimuli_generator import StimuliSpec
+from helpers.ulp_domains import BINADE_OFFSET, DOMAINS_FIELD, Bin, Domain
 from helpers.ulp_provenance import (
     PROVENANCE_FIELDS,
     BudgetTable,
@@ -1005,6 +1006,12 @@ MEASURED: Dict[
     str, Dict[Tuple[str, str, str, str], Union[int, "Floored", Unmeasurable]]
 ] = {}
 
+#: ``{op_name: {(in, out, approx, dest): (Domain, ...)}}``: the list each measured cell
+#: was recorded with (``ulp_domains``), beside its figure in ``MEASURED``. The reading
+#: that wins a cell keeps its list; a cell read twice with differing readings, or
+#: parked as unmeasurable, keeps none (:func:`record`).
+DOMAINS: Dict[str, Dict[Tuple[str, str, str, str], Tuple[Domain, ...]]] = {}
+
 #: The widest ``near_zero_atol`` the emitter writes on its own. A cell whose only
 #: over-ceiling lanes sit in the near-zero band is enrolled with the floor that covers
 #: them (:func:`near_zero_floor`); past this the floor would be forgiving a kernel's
@@ -1075,14 +1082,139 @@ def _max_of(value) -> int:
     return value.max_ulp if isinstance(value, Floored) else int(value)
 
 
+def floor_covered(
+    golden: torch.Tensor,
+    result: torch.Tensor,
+    mask: torch.Tensor,
+    atol: Optional[float],
+) -> torch.Tensor:
+    """The lanes of *mask* a ``near_zero_atol`` of *atol* judges on absolute error
+    instead of steps: ``ulp_elementwise_valid``'s own band, so the entries of a list
+    and the cell's residual leave out the same lanes. Nothing, for no floor."""
+    if atol is None:
+        return torch.zeros_like(mask)
+    from helpers.ulp import ulp_elementwise_valid
+
+    covered = ulp_elementwise_valid(
+        golden, result, 0, near_zero_atol=atol, selected=mask
+    )
+    return covered[2].reshape(mask.shape) & mask
+
+
+def floored_distance(distance: torch.Tensor, covered: torch.Tensor) -> torch.Tensor:
+    """*distance* with the lanes a near-zero floor *covered* read as 0 steps: they are
+    held, by the floor, so for the profile a list is drawn on they are in-budget lanes,
+    not edges. The figures themselves are measured outside the floor
+    (:func:`domain_figures`)."""
+    return torch.where(
+        covered.reshape(distance.shape), torch.zeros_like(distance), distance
+    )
+
+
+def _binade_index(x: torch.Tensor) -> torch.Tensor:
+    """``ulp_domains.binade`` over a tensor of received inputs."""
+    flat = x.reshape(-1).to(torch.float64)
+    _, exponent = torch.frexp(flat)
+    index = exponent.to(torch.int64) - 1 + BINADE_OFFSET
+    return torch.where(
+        flat > 0, index, torch.where(flat < 0, -index, torch.zeros_like(index))
+    )
+
+
+def binade_maxima(
+    x: torch.Tensor, distance: torch.Tensor, judged: torch.Tensor, present: torch.Tensor
+) -> Dict[int, Bin]:
+    """Per signed binade of the received input *x*: lanes *present* (data, not
+    padding), lanes *judged* (ranked, outside the floor) and the worst judged lane --
+    the profile ``ulp_domains.partition`` draws a cell's list on, and what
+    ``--ulp-measure`` records as ``bins``."""
+    index = _binade_index(x)
+    dist = distance.reshape(-1).to(torch.int64)
+    present = present.reshape(-1)
+    judged = judged.reshape(-1)
+    bins: Dict[int, Bin] = {}
+    for b in torch.unique(index[present]).tolist():
+        here = index == b
+        ranked = here & judged
+        n = int(ranked.sum())
+        bins[int(b)] = (
+            int((here & present).sum()),
+            n,
+            int(dist[ranked].max()) if n else -1,
+        )
+    return bins
+
+
+def band_mask(entry: Domain, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """The lanes of *mask* whose received input lies in *entry*."""
+    flat = x.reshape(-1).to(torch.float64)
+    return (mask.reshape(-1) & (flat >= entry.low) & (flat < entry.high)).reshape(
+        mask.shape
+    )
+
+
+def _figure(entry: Domain, x, distance, mask, judged) -> Tuple[Optional[int], int]:
+    """``(worst, lanes)`` over one entry: the worst *judged* lane (ranked, outside the
+    floor), 0 when the floor covers every ranked lane there, ``None`` when none is
+    ranked; and how many lanes are ranked in it."""
+    dist = distance.reshape(-1).to(torch.int64)
+    ranked = band_mask(entry, x, mask).reshape(-1)
+    outside = band_mask(entry, x, judged).reshape(-1)
+    n = int(ranked.sum())
+    if bool(outside.any()):
+        return int(dist[outside].max()), n
+    return (0 if n else None), n
+
+
+def domain_figures(
+    spans,
+    x: torch.Tensor,
+    distance: torch.Tensor,
+    mask: torch.Tensor,
+    judged: torch.Tensor,
+) -> Tuple[Domain, ...]:
+    """Each ``(low, high, ranked)`` of ``ulp_domains.partition`` as the entry the table
+    writes: the worst *judged* lane in it (ranked, outside the floor), 0 where the floor
+    covers every ranked lane, ``None`` where the span is unranked. Measured over the
+    final edges rather than summed from the binades, so the figure written is exactly
+    what the gate will hold the same lanes to."""
+    out = []
+    for low, high, ranked in spans:
+        entry = Domain(low, high, None)
+        figure = _figure(entry, x, distance, mask, judged)[0] if ranked else None
+        out.append(Domain(low, high, figure))
+    return tuple(out)
+
+
+def entry_readings(
+    domains: Tuple[Domain, ...],
+    x: torch.Tensor,
+    distance: torch.Tensor,
+    mask: torch.Tensor,
+    judged: torch.Tensor,
+) -> List[list]:
+    """What the sweep measured over each entry of a list, for the ``--ulp-measure``
+    record: ``[low, high, worst, lanes]`` per entry -- the worst lane outside the floor
+    (0 if the floor covers all of them, -1 where none is ranked) and the ranked lanes.
+    The headroom report holds each entry to its figure from these."""
+    readings = []
+    for entry in domains:
+        worst, n = _figure(entry, x, distance, mask, judged)
+        readings.append([entry.low, entry.high, -1 if worst is None else worst, n])
+    return readings
+
+
 def record(
     op_name: str,
     key: Tuple[str, str, str, str],
     max_ulp: int,
     floor: Optional[Tuple[int, float]] = None,
+    domains: Tuple[Domain, ...] = (),
 ) -> None:
     """Fold one measurement into the cell *key* names, keeping the *worst* lane.
-    *floor* is :func:`near_zero_floor`'s ``(residual, atol)`` when the cell has one.
+    *floor* is :func:`near_zero_floor`'s ``(residual, atol)`` when the cell has one;
+    *domains* the list drawn on the same reading (:func:`domain_figures`), which rides
+    with the reading that wins.
 
     The sweep driver records each cell once per process, so a repeat comes from
     :func:`merge_measured` folding in another xdist worker's reading of it -- or from a
@@ -1097,6 +1229,7 @@ def record(
     but cannot hide error.
     """
     cells = MEASURED.setdefault(op_name, {})
+    lists = DOMAINS.setdefault(op_name, {})
     current = cells.get(key)
     if isinstance(current, Unmeasurable):
         cells[key] = _with_measured(current, max_ulp)
@@ -1104,10 +1237,14 @@ def record(
     new = Floored(max_ulp, *floor) if floor else max_ulp
     if current is None or current == new:
         cells[key] = new
+        if domains or current is None:
+            lists[key] = tuple(domains)
     elif isinstance(new, Floored) or isinstance(current, Floored):
         cells[key] = max(_max_of(new), _max_of(current))
+        lists.pop(key, None)  # two readings, one list of neither: none
     elif new > current:
         cells[key] = new
+        lists[key] = tuple(domains)
 
 
 def record_unmeasurable(
@@ -1122,6 +1259,7 @@ def record_unmeasurable(
     one whose lanes it names), and the larger finite-lane figure.
     """
     cells = MEASURED.setdefault(op_name, {})
+    DOMAINS.setdefault(op_name, {}).pop(key, None)  # no list describes a parked cell
     current = cells.get(key)
     if isinstance(current, Unmeasurable):
         worse, other = sorted(
@@ -1153,6 +1291,7 @@ def export_measured() -> List[list]:
             op,
             list(key),
             asdict(value) if isinstance(value, (Floored, Unmeasurable)) else value,
+            [d.as_entry() for d in DOMAINS.get(op, {}).get(key, ())],
         ]
         for op, cells in MEASURED.items()
         for key, value in cells.items()
@@ -1161,13 +1300,20 @@ def export_measured() -> List[list]:
 
 def merge_measured(rows) -> None:
     """Fold a worker's :func:`export_measured` into this process, worst lane winning."""
-    for op, key, value in rows:
+    for op, key, value, *rest in rows:
+        domains = tuple(Domain(**entry) for entry in (rest[0] if rest else []))
         if isinstance(value, dict) and "why" in value:
             record_unmeasurable(op, tuple(key), Unmeasurable(**value))
         elif isinstance(value, dict):
-            record(op, tuple(key), value["max_ulp"], (value["residual"], value["atol"]))
+            record(
+                op,
+                tuple(key),
+                value["max_ulp"],
+                (value["residual"], value["atol"]),
+                domains=domains,
+            )
         else:
-            record(op, tuple(key), value)
+            record(op, tuple(key), value, domains=domains)
 
 
 def _incomplete_grids() -> List[Tuple[str, str, str, int]]:
@@ -1250,30 +1396,40 @@ def _verdict(measured: int, out_fmt: str) -> Tuple[str, int]:
 
 def _decide(
     cells: Dict[Tuple[str, str, str, str], Union[int, "Floored", Unmeasurable]],
+    domains: Optional[Dict[Tuple[str, str, str, str], Tuple[Domain, ...]]] = None,
 ) -> Dict[Tuple, Tuple]:
-    """Each measured cell as ``(verdict, measured, extra)``; an unmeasurable one as
-    ``(("unmeasurable", verdict), measured, None)``. The verdict is :func:`_verdict`'s
-    for the cell's output format.
+    """Each measured cell as ``(verdict, measured, extra, domains)``; an unmeasurable
+    one as ``(("unmeasurable", verdict), measured, None, ())``. The verdict is
+    :func:`_verdict`'s for the cell's output format; *domains* is the cell's list, part
+    of the value so that collapsing (:func:`_collapse`) merges two cells only when their
+    lists agree as well.
 
     A :class:`Floored` cell whose worst lane demotes it is judged on the lanes outside
     its floor: enrolled at the residual with ``extra = ("floor", atol)``, or, when even
     those are past the ceiling, demoted with the floor that was tried in ``extra =
     ("floor_short", atol, residual)`` so the note can say so."""
+    lists = domains or {}
     decided = {}
     for key, v in cells.items():
+        drawn = tuple(lists.get(key, ()))
         if isinstance(v, Unmeasurable):
-            decided[key] = (("unmeasurable", v), v.measured, None)
+            decided[key] = (("unmeasurable", v), v.measured, None, ())
         elif isinstance(v, Floored):
             plain = _verdict(v.max_ulp, key[1])
             floored = _verdict(v.residual, key[1])
             if plain[0] == "tolerance" and floored[0] == "ulp":
-                decided[key] = (floored, v.residual, ("floor", v.atol))
+                decided[key] = (floored, v.residual, ("floor", v.atol), drawn)
             elif plain[0] == "tolerance":
-                decided[key] = (plain, v.max_ulp, ("floor_short", v.atol, v.residual))
+                decided[key] = (
+                    plain,
+                    v.max_ulp,
+                    ("floor_short", v.atol, v.residual),
+                    drawn,
+                )
             else:
-                decided[key] = (plain, v.max_ulp, None)
+                decided[key] = (plain, v.max_ulp, None, drawn)
         else:
-            decided[key] = (_verdict(v, key[1]), v, None)
+            decided[key] = (_verdict(v, key[1]), v, None, drawn)
     return decided
 
 
@@ -1312,11 +1468,12 @@ def _collapse(decided: Dict[Tuple, Tuple]) -> List[dict]:
         merged[collapsed] = value
 
     rows = []
-    for key, (verdict, measured, extra) in sorted(merged.items()):
+    for key, (verdict, measured, extra, domains) in sorted(merged.items()):
         row = {axes[i]: v for i, v in zip(keep, key)}
         row["verdict"] = verdict
         row["measured"] = measured
         row["extra"] = extra
+        row[DOMAINS_FIELD] = domains
         rows.append(row)
     return rows
 
@@ -1456,18 +1613,29 @@ class UnplacedMeasurements(EmitRefused):
 #: cannot be regenerated from a measurement, so it is preserved rather than replaced
 #: even when this sweep covers its cell. The provenance fields are always the emitter's.
 _RENDERABLE_FIELDS = frozenset(
-    {"in", "out", "approx", "dest", "metric", "near_zero_atol"} | set(PROVENANCE_FIELDS)
+    {"in", "out", "approx", "dest", "metric", "near_zero_atol", DOMAINS_FIELD}
+    | set(PROVENANCE_FIELDS)
 )
 
 
 def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
     """One decided row's fields, and the comment it carries: only what no field holds
-    -- a not-measurable cell's lanes, the floor a demotion tried. The figure is
-    ``measured``, which on a ULP row is the gate; a floor is written exactly as derived
-    (``repr``), with no margin to go stale."""
+    -- a not-measurable cell's lanes, the floor a demotion tried. A cell with a per-
+    element ULP is written as its ``domains`` list and nothing else beside the key and
+    the run (``ulp_domains``): the list is the statement, and its entries were measured
+    outside the floor, so the floor is written whatever the whole-cell verdict. On any
+    other row the figure is ``measured``, which on a ULP row is the gate. A floor is
+    written exactly as derived (``repr``), with no margin to go stale."""
     metric, value = row["verdict"]
     extra = row.get("extra")
     fields: Dict[str, object] = {k: row[k] for k in KEY_AXES if k in row}
+    domains = row.get(DOMAINS_FIELD) or ()
+    if domains:
+        if extra is not None and extra[0] in ("floor", "floor_short"):
+            fields["near_zero_atol"] = repr(float(extra[1]))
+        fields.update(Provenance(run=run).as_fields())
+        fields[DOMAINS_FIELD] = domains
+        return fields, ""
     if metric != "ulp":
         fields["metric"] = "tolerance"
     elif extra is not None and extra[0] == "floor":
@@ -1625,7 +1793,7 @@ def write_table(path, run: date) -> WriteReport:
             kept_verbatim[name] = ", ".join(why)
             i = end
             continue
-        out.extend(_render(lines[i], _collapse(_decide(cells)), run))
+        out.extend(_render(lines[i], _collapse(_decide(cells, DOMAINS.get(name))), run))
         # Rows this run did not supersede -- a format it does not reach, an arch-keyed
         # entry -- are the measurement of a different run and stay as they are, naming
         # it. Replacing a whole op block deleted them.

@@ -10,12 +10,14 @@ ULP row ``measured`` is the gate. Where a comment is asserted, it is to check th
 prose is read back as written.
 """
 
+import math
 from dataclasses import fields
 from datetime import date, datetime
 
 import pytest
 from helpers.sfpu_accuracy_budget import _SFPU_ACCURACY_BUDGET, _TABLE_PATH
 from helpers.sfpu_domains import _UNARY_OPS_NOT_SWEPT, sfpu_unary_ops
+from helpers.ulp_domains import Domain
 from helpers.ulp_provenance import (
     PROVENANCE_FIELDS,
     BudgetTable,
@@ -297,6 +299,34 @@ def test_an_op_the_walk_cannot_place_is_refused():
     with pytest.raises(  # allow-pytest.raises: host-only test
         ValueError, match=r"cannot locate op\(s\) \['True'\]"
     ):
-        BudgetTable(
-            "true:\n  - {out: Float16_b, measured: 2, run: 2026-10-05}\n"
-        )
+        BudgetTable("true:\n  - {out: Float16_b, measured: 2, run: 2026-10-05}\n")
+
+
+def test_a_list_row_is_rendered_in_the_one_spelling_and_read_back():
+    """`repr` would spell an infinity `inf`, which YAML reads as a string; the renderer
+    spells the list as `ulp_domains` does, and the walk reads it back as entries with
+    the metric and figure the list implies."""
+    entries = (Domain(-math.inf, -1, 3), Domain(-1, 1, 10), Domain(1, math.inf, 3))
+    line = render_row(
+        {
+            "in": "Float16_b",
+            "out": "Float16_b",
+            "dest": "No",
+            "run": _DAY,
+            "domains": entries,
+        }
+    )
+    assert line == (
+        '  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-05, domains: '
+        "[{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, "
+        "{low: 1, high: .inf, ulp: 3}]}\n"
+    )
+    (row,) = BudgetTable("Tanh:\n" + line).rows
+    assert row.domains == entries
+    assert (row.metric, row.max_ulp) == ("tolerance", None)  # 10 is past bf16's 6
+    assert row.provenance == Provenance(run=_DAY) and not row.unmeasurable
+    within = render_row(
+        {"in": "Float16_b", "out": "Float32", "run": _DAY, "domains": entries}
+    )
+    (row,) = BudgetTable("Tanh:\n" + within).rows
+    assert (row.metric, row.max_ulp) == ("ulp", 10)  # fp32's ceiling is 419,430

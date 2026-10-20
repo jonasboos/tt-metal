@@ -27,6 +27,19 @@
 #                 the row: every value of a 16-bit input, a stride of a Float32 one; or
 #   sampled       the day a functional driver's sample did; never both
 #
+# A row the exhaustive sweep writes for a cell with a per-element ULP carries, instead
+# of a figure and a metric, its `domains` list: one line that says how the op behaves
+# over the whole swept range of that format combination (tests/SFPU_ULP.md, "Where an
+# op holds its figure"):
+#
+#   domains: [{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]
+#
+# An entry holds the lanes with low <= x < high, x as the kernel received it; `ulp` is
+# the worst lane there (outside the near-zero floor, on a row that has one), or null
+# where no lane is ranked. An entry within the output's usable ceiling is gated at its
+# figure; one past it is measured, not gated. The whole-cell contract is derived: gated
+# at the largest figure when every entry is within the ceiling, tolerance otherwise.
+#
 # The loader refuses a figure without its date. There is no headroom over a figure: the
 # sweep holds a cell to exactly what was measured, a worse measurement is recorded by
 # a re-emit, and the PR guard reads that as a raised gate, which lands in a change of

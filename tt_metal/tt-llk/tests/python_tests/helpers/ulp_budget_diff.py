@@ -33,6 +33,16 @@ from xml.etree import ElementTree
 import yaml
 
 if __package__:
+    from .ulp_domains import (
+        CEILINGS,
+        DOMAIN_MIN_BIN_LANES,
+        DOMAINS_FIELD,
+        Domain,
+        check_domains,
+        domains_text,
+        number_text,
+        partition,
+    )
     from .ulp_provenance import (
         KEY_FIELDS,
         PROVENANCE_FIELDS,
@@ -42,6 +52,16 @@ if __package__:
         key_value,
     )
 else:  # run by path on the slim runner, where `helpers/__init__.py` cannot import
+    from ulp_domains import (
+        CEILINGS,
+        DOMAIN_MIN_BIN_LANES,
+        DOMAINS_FIELD,
+        Domain,
+        check_domains,
+        domains_text,
+        number_text,
+        partition,
+    )
     from ulp_provenance import (
         KEY_FIELDS,
         PROVENANCE_FIELDS,
@@ -63,8 +83,26 @@ MEASURED_ARCH = "WORMHOLE"
 ULP_GATED_OUTPUTS = frozenset({"Float16_b", "Float16", "Float32", "Bfp8_b"})
 
 #: The fields a row may carry beyond its key: ``sfpu_accuracy_budget._CONTRACT_FIELDS``.
-#: A ULP row's gate is its ``measured`` figure, a provenance field.
+#: A ULP row's gate is its ``measured`` figure, a provenance field -- or its ``domains``
+#: list (``ulp_domains``), which stands in for every cell-level field.
 CONTRACT_FIELDS = frozenset({"metric", "atol", "rtol", "near_zero_atol"})
+
+#: ``sfpu_accuracy_budget._NOT_BESIDE_DOMAINS``: what a row with a list may not carry.
+#: Spelled out for the same reason as MEASURED_ARCH; a host test ties the two.
+NOT_BESIDE_DOMAINS = (
+    "measured",
+    "metric",
+    "max_ulp",
+    "sampled",
+    "atol",
+    "rtol",
+    "nonfinite",
+)
+
+#: The outputs a ``domains`` list may describe: those with a per-element ULP, which is
+#: ULP_GATED_OUTPUTS less the block float, whose ULP is a proxy. A host test ties it to
+#: ``ulp.has_ulp_gate`` and ``_ULP_PROXY_DTYPES``.
+LIST_OUTPUTS = frozenset({"Float16_b", "Float16", "Float32"})
 
 #: The sweep's skip reasons for a cell it measured and recorded but does not gate. A
 #: skip that does not carry it (off Wormhole, ``--compile-producer``) wrote nothing.
@@ -95,6 +133,9 @@ class Row:
     #: The measurement the row records, from its own fields. A raise that comes with a
     #: new one is a re-measurement; one that leaves it as it was is a number edited.
     provenance: Provenance
+    #: The row's ``domains`` list, or ``()``: then the gate is entry by entry, and
+    #: ``max_ulp`` is the whole-cell figure the list implies (``ulp_domains``).
+    domains: Tuple[Domain, ...] = ()
     #: The near-zero floor is part of the gate: `ulp_elementwise_valid` accepts a lane
     #: inside it however many steps out it is, so widening it loosens the gate.
     near_zero_atol: Optional[float] = None
@@ -111,6 +152,12 @@ class Row:
         """Whether the row carries a step budget. Whether that budget *binds* depends on
         the arch it is asked about too: see :func:`_gates`."""
         return self.max_ulp is not None
+
+    @property
+    def ceiling(self) -> Optional[float]:
+        """The usable ceiling of the row's output, or ``None`` when it pins none with a
+        per-element ULP."""
+        return CEILINGS.get(dict(self.key).get("out", ""))
 
     @property
     def declares_tolerance(self) -> bool:
@@ -154,6 +201,10 @@ class Change:
     held_before: str = "—"
     held_after: str = "—"
     remeasured: Optional[bool] = False
+    #: The input range the change is about, ``[low, high)``, when either side's row
+    #: carries a ``domains`` list and the cell is judged segment by segment; empty for
+    #: a whole-cell change.
+    segment: str = ""
 
     #: The kinds that weaken a gate. Everything else is neutral or an improvement.
     REGRESSIONS = frozenset(
@@ -207,14 +258,59 @@ def _check_number(where: str, name: str, value, *, integer: bool = False) -> Non
         )
 
 
+def _check_list_row(where: str, fields: dict) -> None:
+    """What the registry refuses on a row with a ``domains`` list
+    (``sfpu_accuracy_budget._list_contract``): a cell-level field beside it, a row that
+    does not pin the formats it was measured on or name its run, an output with no
+    per-element ULP, or a list ``ulp_domains.check_domains`` refuses."""
+    for field in NOT_BESIDE_DOMAINS:
+        if field in fields:
+            raise ValueError(
+                f"{where}: `{field}` does not belong beside `{DOMAINS_FIELD}`; the list "
+                "is the whole statement"
+            )
+    if fields.get("in") is None or fields.get("out") is None:
+        raise ValueError(
+            f"{where}: a `{DOMAINS_FIELD}` list needs the row to pin `in` and `out`"
+        )
+    if "run" not in fields:
+        raise ValueError(
+            f"{where}: a `{DOMAINS_FIELD}` list names the `run` that measured it"
+        )
+    check_provenance(where, fields, tolerance=True)
+    if key_value(fields["out"]) not in LIST_OUTPUTS:
+        raise ValueError(
+            f"{where}: {fields['out']} has no per-element ULP, so no `{DOMAINS_FIELD}`"
+        )
+    check_domains(where, fields[DOMAINS_FIELD])
+    if fields.get("near_zero_atol") is not None:
+        _check_number(where, "near_zero_atol", fields["near_zero_atol"])
+    for flag in ("approx", "dest"):
+        if fields.get(flag) is not None and key_value(fields[flag]) not in (
+            "Yes",
+            "No",
+        ):
+            raise ValueError(f"{where}: {flag} must be Yes or No, got {fields[flag]!r}")
+
+
 def _check_row(where: str, fields: dict) -> None:
     """What the registry refuses in one row, so a table it cannot load gets no verdict:
     an unknown field, a metric that is neither, provenance fields wrong on their own or
     for the row's contract (:func:`check_provenance`, the registry's own check), a bad
-    number, or the two metrics' fields mixed in one row."""
-    unknown = set(fields) - set(KEY_FIELDS) - CONTRACT_FIELDS - set(PROVENANCE_FIELDS)
+    number, the two metrics' fields mixed in one row, or a ``domains`` list the
+    registry would not take (:func:`_check_list_row`)."""
+    unknown = (
+        set(fields)
+        - set(KEY_FIELDS)
+        - CONTRACT_FIELDS
+        - set(PROVENANCE_FIELDS)
+        - {DOMAINS_FIELD}
+    )
     if unknown:
         raise ValueError(f"{where}: unknown field(s) {sorted(unknown)}")
+    if DOMAINS_FIELD in fields:
+        _check_list_row(where, fields)
+        return
     metric = fields.get("metric", "ulp")
     if metric not in ("ulp", "tolerance"):
         raise ValueError(f"{where}: metric must be ulp or tolerance, got {metric!r}")
@@ -267,6 +363,7 @@ def parse_table(text: str) -> Dict[Cell, Row]:
             near_zero_atol=row.near_zero_atol,
             atol=_number(values.get("atol")),
             rtol=_number(values.get("rtol")),
+            domains=row.domains,
             alias=row.alias,
         )
     return rows
@@ -511,14 +608,127 @@ _KIND_ORDER = (
 )
 
 
+#: A row as spans over the input: ``(low, high, state, figure)``, state one of
+#: ``gated`` (held to the figure), ``past`` (measured, held by the headroom report),
+#: ``null`` (an entry no lane is ranked in) or ``none`` (no row, or nothing recorded).
+_Span = Tuple[float, float, str, Optional[int]]
+_INF = float("inf")
+
+
+def _spans(row: Optional[Row], key: Tuple[Tuple[str, str], ...]) -> List[_Span]:
+    """*row* over ``(-inf, inf)``: its list's entries, each gated or past by the
+    output's ceiling, or one span for a plain row -- gated at its figure, past the
+    ceiling with the measurement it records, or none. A row that does not bind on the
+    arch asked about (:func:`_gates`) holds nothing."""
+    if row is None:
+        return [(-_INF, _INF, "none", None)]
+    asked = dict(key)
+    binds = asked.get("arch", MEASURED_ARCH) == MEASURED_ARCH or "arch" in dict(row.key)
+    if row.domains:
+        ceiling = CEILINGS.get(asked.get("out", ""), _INF)
+        spans = []
+        for d in row.domains:
+            if d.ulp is None:
+                state = "null"
+            else:
+                state = "gated" if binds and d.ulp <= ceiling else "past"
+            spans.append((d.low, d.high, state, d.ulp))
+        return spans
+    if _gates(row, key):
+        return [(-_INF, _INF, "gated", row.max_ulp)]
+    figure = recorded_max(row)
+    return [(-_INF, _INF, "past" if figure is not None else "none", figure)]
+
+
+def _span_at(spans: List[_Span], x: float) -> _Span:
+    for span in spans:
+        if span[0] <= x < span[1]:
+            return span
+    return (-_INF, _INF, "none", None)
+
+
+def _span_text(span: _Span) -> str:
+    _, _, state, figure = span
+    if state == "gated":
+        return str(figure)
+    if state == "past":
+        return f"tolerance (max {figure})"
+    return "unranked" if state == "null" else "—"
+
+
+def _classify_segment(was: _Span, now: _Span) -> Optional[str]:
+    """:func:`_classify` for one segment of the input: how what its lanes are held to
+    has changed, or ``None``."""
+    before, after = was[2], now[2]
+    if before == "gated":
+        if after == "gated":
+            if now[3] > was[3]:
+                return "raised"
+            return "tightened" if now[3] < was[3] else None
+        return "removed" if after == "none" else "ungated"
+    if before == "past":
+        if after == "gated":
+            return "gated"
+        if after == "past":
+            return "baseline_raised" if now[3] > was[3] else None
+        return "baseline_dropped"
+    if after == "gated":
+        return "gated"
+    return "added" if after == "past" else None
+
+
+def _inside(low: float, high: float) -> float:
+    """A point strictly inside ``[low, high)``, with infinite ends."""
+    if (low, high) == (-_INF, _INF):
+        return 0.0
+    if high == _INF:
+        return low + 1.0
+    if low == -_INF:
+        return high - 1.0
+    return (low + high) / 2
+
+
+def _segment_changes(
+    was_row: Optional[Row], now_row: Optional[Row], key: Tuple[Tuple[str, str], ...]
+) -> List[Tuple[str, str, str, str]]:
+    """``(kind, segment, held_before, held_after)`` for each run of the input over
+    which the two rows' gates differ, by the union of both lists' edges; adjacent
+    segments that changed the same way are one range."""
+    before, after = _spans(was_row, key), _spans(now_row, key)
+    edges = sorted(
+        {e for spans in (before, after) for lo, hi, _, _ in spans for e in (lo, hi)}
+    )
+    found: List[list] = []
+    for lo, hi in zip(edges, edges[1:]):
+        was, now = _span_at(before, _inside(lo, hi)), _span_at(after, _inside(lo, hi))
+        kind = _classify_segment(was, now)
+        if kind is None:
+            continue
+        held = (kind, _span_text(was), _span_text(now))
+        if found and found[-1][0] == held and found[-1][2] == lo:
+            found[-1][2] = hi
+        else:
+            found.append([held, lo, hi])
+    return [
+        (kind, f"[{number_text(lo)}, {number_text(hi)})", before_text, after_text)
+        for (kind, before_text, after_text), lo, hi in found
+    ]
+
+
 def compare(base: Dict[Cell, Row], head: Dict[Cell, Row]) -> List[Change]:
     """Every cell whose *resolved* gate differs, strongest change first.
 
     Resolved, not row by row, because the table's shape is not the gate: deleting a
     row the sweep collapsed is no loss while a broader row gives the same budget, and a
-    new `{in: Float32, max_ulp: 1000}` under a `max_ulp: 2` default loosens every
+    new `{in: Float32, measured: 1000}` under a `measured: 2` default loosens every
     Float32 cell without any row being raised. Variants the same pair of rows decides
     the same way collapse into one ``Change``.
+
+    Where either side's row carries a ``domains`` list, the cell is judged segment by
+    segment over the union of both lists' edges (:func:`_segment_changes`): an entry
+    raised, a list replaced by a looser one, or a plain row turned into a list are each
+    reported for exactly the lanes they change, and a list redrawn with the same figures
+    is no change at all.
     """
     grouped: Dict[Tuple, Change] = {}
     for op in sorted({c[0] for c in base} | {c[0] for c in head}):
@@ -529,10 +739,31 @@ def compare(base: Dict[Cell, Row], head: Dict[Cell, Row]) -> List[Change]:
         for key in _variants(base, head, op):
             was = _held(base, op, key, open_dims)
             now = _held(head, op, key, open_dims)
+            deciding = now.row if now.row is not None else was.row
+            if deciding is not None and (
+                (was.row is not None and was.row.domains)
+                or (now.row is not None and now.row.domains)
+            ):
+                for kind, segment, before_text, after_text in _segment_changes(
+                    was.row, now.row, key
+                ):
+                    ident = (op, kind, deciding.key, segment, before_text, after_text)
+                    found = grouped.get(ident)
+                    grouped[ident] = Change(
+                        (op, deciding.key),
+                        kind,
+                        was.row,
+                        now.row,
+                        variants=found.variants + 1 if found else 1,
+                        held_before=before_text,
+                        held_after=after_text,
+                        remeasured=_remeasured(base, now.row, kind),
+                        segment=segment,
+                    )
+                continue
             kind = _classify(was, now)
             if kind is None:
                 continue
-            deciding = now.row if now.row is not None else was.row
             # Grouped by the deciding row and what the cell is held to on each side: a
             # collapsed row replacing N keyed rows of one budget is one line marked xN.
             ident = (op, kind, deciding.key, was.describe(), now.describe())
@@ -547,7 +778,9 @@ def compare(base: Dict[Cell, Row], head: Dict[Cell, Row]) -> List[Change]:
                 held_after=now.describe(),
                 remeasured=_remeasured(base, now.row, kind, was.row),
             )
-    return sorted(grouped.values(), key=lambda c: (_KIND_ORDER.index(c.kind), c.cell))
+    return sorted(
+        grouped.values(), key=lambda c: (_KIND_ORDER.index(c.kind), c.cell, c.segment)
+    )
 
 
 def _remeasured(
@@ -609,7 +842,8 @@ _KIND_TEXT = {
 
 def _describe(c: Change) -> str:
     row = c.after or c.before
-    return row.describe() + (f" ×{c.variants}" if c.variants > 1 else "")
+    text = row.describe() + (f" x in {c.segment}" if c.segment else "")
+    return text + (f" ×{c.variants}" if c.variants > 1 else "")
 
 
 def _md_table(
@@ -739,6 +973,50 @@ def _measured_cells(rows: Iterable[dict]) -> Dict[Cell, int]:
     return _readings(rows)[0]
 
 
+#: Per cell, what the sweep measured over each entry of its list: ``(low, high) ->
+#: (worst, lanes)``; under the key ``None``, the most ranked lanes any one binade of a
+#: null entry had, ``(low, high) -> lanes``, from the row's ``bins`` profile.
+EntryReadings = Dict[Cell, Dict[Optional[Tuple[float, float]], object]]
+
+
+def _binade_ranked(bins, low: float, high: float) -> int:
+    """The most ranked lanes in any one binade of ``[low, high)``, from a recorded
+    ``bins`` profile: what the rule asks of a binade before it is ranked."""
+    return max(
+        (int(ranked) for b, _, ranked, _ in bins if low <= _binade_low(int(b)) < high),
+        default=0,
+    )
+
+
+def _entry_readings(rows: Iterable[dict]) -> EntryReadings:
+    """From ``--ulp-measure`` rows, per cell, what the sweep measured over each entry
+    of the table's list (``ulp_sweep.entry_readings``; infinities are spelled as strings
+    in the file), and from its ``bins`` profile how many lanes any one binade of an entry
+    ranks. Several readings of one entry keep the worst."""
+    readings: EntryReadings = {}
+    for row in rows:
+        bins = row.get("bins") or ()
+        for entry in row.get("domains") or ():
+            try:
+                low, high = float(entry[0]), float(entry[1])
+                worst, lanes = int(entry[2]), int(entry[3])
+            except (TypeError, ValueError, IndexError) as bad:
+                raise Unreadable(
+                    f"a --ulp-measure `domains` entry is malformed ({bad!r}): {row}"
+                ) from None
+            cell = readings.setdefault(_measured_cell(row), {})
+            was = cell.get((low, high))
+            cell[(low, high)] = (
+                (max(worst, was[0]), max(lanes, was[1])) if was else (worst, lanes)
+            )
+            if bins:
+                per_binade = cell.setdefault(None, {})
+                per_binade[(low, high)] = max(
+                    per_binade.get((low, high), 0), _binade_ranked(bins, low, high)
+                )
+    return readings
+
+
 def _nonfinite_cells(rows: Iterable[dict]) -> Dict[Cell, int]:
     """Per cell, the most lanes where the hardware and the golden disagree about being
     finite (:func:`_readings`)."""
@@ -765,8 +1043,8 @@ def recorded_max(row: Row) -> Optional[int]:
     return row.provenance.measured
 
 
-def _headroom_line(cell: Cell, worst: int, reference: int, verdict: str) -> str:
-    return f"| `{_cell_name(*cell)}` | {worst} | {reference} | {verdict} |"
+def _headroom_line(name: str, worst, reference, verdict: str) -> str:
+    return f"| `{name}` | {worst} | {reference} | {verdict} |"
 
 
 #: The labels of the sweep's test id after the op (test_unary_sfpu_ulp.py's parametrize
@@ -872,6 +1150,7 @@ def render_headroom(
     failures: Iterable[Failure] = (),
     completed: Iterable[Tuple[str, str, str, str, str]] = (),
     empty: Iterable[Cell] = (),
+    entries: Optional[EntryReadings] = None,
 ) -> Tuple[str, int]:
     """The report, and the regression count the command fails on.
 
@@ -895,12 +1174,23 @@ def render_headroom(
     the recorder swallows a failed write, so it is listed and counts as a regression.
     An empty comparison -- nothing measured, nothing failed -- fails too: it is a sweep
     that did not run, not one that passed.
+
+    *entries* are the readings over each entry of a row's ``domains`` list
+    (:func:`_entry_readings`). A cell whose row carries a list is judged entry by
+    entry, by the same rule: a gated entry over its figure is over budget, one past the
+    ceiling over its figure has regressed, a better reading is a re-emit's to tighten,
+    and a null entry some binade of which now ranks ``DOMAIN_MIN_BIN_LANES`` lanes or
+    more (from the row's ``bins`` profile; the entry's lane count without one) is
+    listed, since the list is stale there -- fewer is what the rule leaves unranked by
+    design. An entry the run did not read (the list changed since) is not judged.
     """
     over: List[str] = []
     regressed: List[str] = []
     better: List[str] = []
+    answers: List[str] = []
     unjudged = 0
     uncovered = 0
+    judged_entries = 0
     empty = set(empty)
     listed = set()  # the cells a section above already names, as failures key them
     for cell, count in sorted((nonfinite or {}).items()):
@@ -908,33 +1198,81 @@ def render_headroom(
         if row is None or count <= recorded_nonfinite(row):
             continue
         regressed.append(
-            _headroom_line(cell, count, recorded_nonfinite(row), "non-finite lanes")
+            _headroom_line(
+                _cell_name(*cell), count, recorded_nonfinite(row), "non-finite lanes"
+            )
         )
         listed.add(_same_cell(cell))
     for cell, worst in sorted(measured.items()):
         row = _resolve(table, *cell)
+        name = _cell_name(*cell)
         if row is None:
             # On the registry's default tolerance: no row records a figure for it.
             uncovered += 1
+            continue
+        if row.domains:
+            readings = (entries or {}).get(cell, {})
+            ceiling = row.ceiling if row.ceiling is not None else _INF
+            if not readings:
+                unjudged += 1
+                continue
+            for entry in row.domains:
+                got = readings.get((entry.low, entry.high))
+                if got is None:
+                    unjudged += 1
+                    continue
+                judged_entries += 1
+                seen, lanes = got
+                where = (
+                    f"{name} x in [{number_text(entry.low)}, {number_text(entry.high)})"
+                )
+                if entry.ulp is None:
+                    per_binade = readings.get(None, {}).get((entry.low, entry.high))
+                    if (
+                        lanes if per_binade is None else per_binade
+                    ) >= DOMAIN_MIN_BIN_LANES:
+                        answers.append(
+                            _headroom_line(where, seen, "unranked", "now answers")
+                        )
+                elif lanes == 0:
+                    regressed.append(
+                        _headroom_line(where, 0, entry.ulp, "no lane measurable")
+                    )
+                    listed.add(_same_cell(cell))
+                elif seen > entry.ulp:
+                    gated = entry.ulp <= ceiling
+                    (over if gated else regressed).append(
+                        _headroom_line(
+                            where,
+                            seen,
+                            entry.ulp,
+                            "over budget" if gated else "regressed",
+                        )
+                    )
+                    listed.add(_same_cell(cell))
+                elif seen < entry.ulp:
+                    better.append(
+                        _headroom_line(where, seen, entry.ulp, "re-emit tightens")
+                    )
             continue
         if not _gates(row, cell[1]):
             was = recorded_max(row)
             if was is None:
                 unjudged += 1
             elif cell in empty:
-                regressed.append(_headroom_line(cell, 0, was, "no lane measurable"))
+                regressed.append(_headroom_line(name, 0, was, "no lane measurable"))
                 listed.add(_same_cell(cell))
             elif worst > was:
-                regressed.append(_headroom_line(cell, worst, was, "regressed"))
+                regressed.append(_headroom_line(name, worst, was, "regressed"))
                 listed.add(_same_cell(cell))
         elif worst > row.max_ulp:
-            over.append(_headroom_line(cell, worst, row.max_ulp, "over budget"))
+            over.append(_headroom_line(name, worst, row.max_ulp, "over budget"))
             listed.add(_same_cell(cell))
         elif worst < row.max_ulp:
             # The figure is the measurement, so a better reading is a row a re-emit
             # tightens; nothing in between, since a gate equal to its reading is the
             # rule, not news.
-            better.append(_headroom_line(cell, worst, row.max_ulp, "re-emit tightens"))
+            better.append(_headroom_line(name, worst, row.max_ulp, "re-emit tightens"))
 
     failed = [
         f"| `{f.test}` | {f.message.replace('|', '&#124;')} |"
@@ -954,7 +1292,10 @@ def render_headroom(
             "",
         ]
         return "\n".join(out), 1
-    out += [f"{len(measured)} cell(s) measured.", ""]
+    out += [
+        f"{len(measured)} cell(s) measured, {judged_entries} list entries judged.",
+        "",
+    ]
     if unjudged or uncovered:
         # Not a failure, but not a pass either: without a recorded figure there is
         # nothing to hold the cell to, and a clean summary must not read as covering it.
@@ -976,6 +1317,13 @@ def render_headroom(
             "Measured better than the row's figure (a re-emit tightens these)",
             better,
             "figure",
+            True,
+        ),
+        (
+            "Entries the table holds unranked where the op now answers (a re-emit "
+            "redraws these)",
+            answers,
+            "table",
             True,
         ),
     )
@@ -1010,7 +1358,7 @@ def render_headroom(
             *_md_table(("cell (op, in, out, approx, dest_acc)",), lines),
             "",
         ]
-    if not (over or regressed or better or failed or unrecorded):
+    if not (over or regressed or better or answers or failed or unrecorded):
         out += [
             "Every gated cell measures exactly its figure, and no judged tolerance cell "
             "is past its recorded measurement.",
@@ -1073,9 +1421,81 @@ def _headroom(args) -> Tuple[str, int]:
         failures, completed = junit_failures(junit), junit_completed(junit)
     worst, nonfinite, empty = _readings(rows)
     report, regressions = render_headroom(
-        table, worst, nonfinite, failures, completed, empty
+        table, worst, nonfinite, failures, completed, empty, _entry_readings(rows)
     )
     return report, 1 if regressions else 0
+
+
+def _read_jsonl(path: Path) -> List[dict]:
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    rows = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as bad:
+                raise Unreadable(f"{path}:{number} is not JSON ({bad})") from None
+    return rows
+
+
+def _binade_low(index: int) -> float:
+    """The low edge of a signed binade index (``ulp_domains.binade_edges``): a point
+    inside it, for placing a binade in a drawn domain."""
+    if index == 0:
+        return 0.0
+    k = abs(index) - 150
+    return 2.0**k if index > 0 else -(2.0 ** (k + 1))
+
+
+def render_domains(
+    rows: List[dict], table: Optional[Dict[Cell, Row]] = None, op: Optional[str] = None
+) -> str:
+    """Per measured cell with a ``bins`` profile, the list the emitter's rule draws on
+    it (``ulp_domains.partition``, each entry's figure the worst of its binades) beside
+    the list the table holds, if a table is given: the offline view of the per-value
+    array, for reading what a re-emit would write without a device."""
+    out = ["### SFPU ULP domains from the sweep's binade profiles", ""]
+    shown = 0
+    for row in rows:
+        if op and row.get("op") != op:
+            continue
+        bins = row.get("bins")
+        out_fmt = row.get("out")
+        if not bins or out_fmt not in CEILINGS:
+            continue
+        profile = {int(b): (int(p), int(r), int(w)) for b, p, r, w in bins}
+        cell = _measured_cell(row)
+        drawn = []
+        for low, high, ranked in partition(profile, CEILINGS[out_fmt]):
+            worst = [
+                w
+                for b, (p, r, w) in profile.items()
+                if r and low <= _binade_low(b) < high
+            ]
+            drawn.append(
+                {
+                    "low": low,
+                    "high": high,
+                    "ulp": max(worst) if ranked and worst else None,
+                }
+            )
+        out.append(f"- `{_cell_name(*cell)}`: {domains_text(drawn)}")
+        if table is not None:
+            held = _resolve(table, *cell)
+            if held is not None and held.domains:
+                out.append(f"  - table: {domains_text(held.domains)}")
+        shown += 1
+    if not shown:
+        out.append(
+            "No measured cell carries a `bins` profile (the sweep writes one per cell "
+            "with a per-element ULP)."
+        )
+    return "\n".join(out) + "\n"
+
+
+def _domains(args) -> Tuple[str, int]:
+    table = parse_table(args.table.read_text(encoding="utf-8")) if args.table else None
+    return render_domains(_read_jsonl(args.measured), table, args.op), 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1106,9 +1526,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     h.add_argument("--out", type=Path)
 
+    m = sub.add_parser(
+        "domains",
+        help="the domains list the emitter's rule draws on each cell's recorded binade "
+        "profile, from a --ulp-measure file, beside the table's list",
+    )
+    m.add_argument("--measured", type=Path, required=True)
+    m.add_argument("--table", type=Path, help="show each cell's current list as well")
+    m.add_argument("--op", help="one op, matched exactly")
+    m.add_argument("--out", type=Path)
+
     args = parser.parse_args(argv)
     try:
-        report, status = (_diff if args.mode == "diff" else _headroom)(args)
+        report, status = {"diff": _diff, "headroom": _headroom, "domains": _domains}[
+            args.mode
+        ](args)
     except Unreadable as bad:
         report, status = f"### SFPU ULP budgets\n\nCannot read the input: {bad}\n", 2
     except (ValueError, yaml.YAMLError) as refused:
