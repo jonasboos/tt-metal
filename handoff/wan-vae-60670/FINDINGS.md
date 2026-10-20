@@ -189,12 +189,45 @@ always-busy cores as the dev host. The container cannot see `/opt/weka`, so the 
 on the CI hosts is still unknown (the `/mnt/weka` mount point is dated 10-05 on both hosts, which is
 not the install date).
 
-### Fix
+### Fix, first attempt (rejected): 32 torch threads globally
 
-Branch `jameslee/fix-60670-tt-dit-torch-threads` (off `main`, commit `221e1c81915`):
-`models/tt_dit/tests/conftest.py` sets torch to one thread per **physical** core in the process
-affinity (counting SMT siblings once) instead of `os.cpu_count()`. On these hosts that is 32.
-Validation run on bh_sc1: 39484292256 (full Wan T2V sc1 job: perf 480p/720p + 720p pipeline).
+Branch `jameslee/fix-60670-tt-dit-torch-threads` (`221e1c81915`) changed the conftest to one torch
+thread per physical core. Validation run 39484292256:
+- Attempt 1 never ran: host `bh-glx-120-d04u02` device 23 failed GDDR training on all 10 IPMI
+  resets (`smc_init_status=0x10`). Report that host to infra.
+- Attempt 2 (`bh-glx-120-d04u14`): **720p VAE 0.6055 s, PASS**. But 480p timed out (>1800 s).
+
+Halving the threads doubles the bulk host work on the cold-cache path. Every fresh CI container
+converts the transformer weights from PyTorch:
+
+| Run | torch threads | `convert WanTransformer3DModel` (×2) |
+|---|---|---|
+| 09-14 good, 09-16 bad, probe A | 64 | 342–447 s each |
+| probe E, fix attempt 2 | 32 | 645–994 s each |
+
+That pushes the first (480p) perf test past its 1800 s timeout. Not acceptable.
+
+### Fix (current): cap threads only inside `_reassemble_2d`
+
+Locally, the same 32 copies with 64 threads take 210–300 ms even when restructured (a single
+gather + permute, or copying straight into the output slice). At 64 threads, even large ops lose
+time on these hosts. Capping threads to physical cores for the duration of the call and restoring
+afterwards fixes the readback without touching bulk work:
+
+| `_reassemble_2d` (64 torch threads in the process) | 480p | 720p |
+|---|---|---|
+| current | 424 ms | 464 ms |
+| **thread cap scoped to the call** (switch cost included) | **16.4 ms** | **33.4 ms** |
+
+Output is bit-identical, and the thread count is 64 again afterwards.
+
+Branch `jameslee/fix-60670-reassemble-threads` (off `main`, commit `b1eac850de6`), one file:
+`models/tt_dit/utils/tensor.py` adds `_physical_cores_in_affinity()` and a
+`_cap_torch_threads_to_physical_cores` decorator on `_reassemble_2d`. Validation run on bh_sc1:
+39501497353 (full Wan T2V sc1 job).
+
+The infra-side fix is to keep CI job cpusets off the Weka-dedicated cores (CPUs 1–2 and their SMT
+siblings 33–34), as Weka recommends for dedicated cores.
 
 **Open question for infra:** when the Weka client (busy-polling CPUs 1–2) was deployed to the
 `multihost-ci-sc1-*` galaxy hosts. The regression starts between 2026-09-14 03:33 and
