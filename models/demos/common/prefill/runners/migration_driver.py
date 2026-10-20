@@ -875,7 +875,7 @@ def main() -> None:
             f"[migration_driver] prefill done wall={stats.wall_s:.1f}s pushes={stats.total_pushes} "
             f"requests={stats.completed}"
         )
-        wait_for_layer_completions(drain, chunk_layers * stats.total_pushes)
+        wait_for_layer_completions(drain, chunk_layers * stats.total_chunks)
     finally:
         if drain is not None:
             drain.stop()

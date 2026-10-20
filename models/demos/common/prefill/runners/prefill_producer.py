@@ -1712,18 +1712,17 @@ def main() -> None:
                 ChunkPush(0, cidx, cidx * CHUNK_SIZE, (cidx + 1) * CHUNK_SIZE, warmup_chunks * CHUNK_SIZE)
                 for cidx in range(warmup_chunks)
             ]
-            warmup_forwards = [warmup[i : i + FORWARD_CHUNKS] for i in range(0, warmup_chunks, FORWARD_CHUNKS)]
-            for pushes in warmup_forwards:
-                push_forward(pushes)
+            for i in range(0, warmup_chunks, FORWARD_CHUNKS):
+                push_forward(warmup[i : i + FORWARD_CHUNKS])
             service.barrier()
-            wait_for_layer_completions(drain, chunk_layers * len(warmup_forwards))
+            wait_for_layer_completions(drain, chunk_layers * warmup_chunks)
             logger.info("[producer] warmup complete; starting the measured request")
 
         stats = run_schedule(cfg, push_fn=push_forward)
         service.barrier()
         # One completion per layer per chunk; chunk_layers is what the runner emits (KV-writing layers plus
         # MTP/DFlash extras), not NUM_LAYERS. The count is cumulative, so it includes the warm-up.
-        wait_for_layer_completions(drain, chunk_layers * (max(warmup_chunks, 0) + stats.total_pushes))
+        wait_for_layer_completions(drain, chunk_layers * (max(warmup_chunks, 0) + stats.total_chunks))
     finally:
         if drain is not None:
             drain.stop()
