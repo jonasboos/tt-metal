@@ -50,6 +50,6 @@ class _LogStartPlugin:
         print(f"\n\n{'━' * width}\n{label}\n")  # noqa: T201
 
 
-num_torch_threads = max(1, os.cpu_count())
+num_torch_threads = int(os.environ.get("TT_DIT_TORCH_THREADS", "0")) or max(1, os.cpu_count())
 logger.info(f"Setting torch num_threads to {num_torch_threads}")
 torch.set_num_threads(num_torch_threads)
