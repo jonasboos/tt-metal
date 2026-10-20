@@ -536,7 +536,8 @@ private:
 #endif
 
 #ifdef ARCH_QUASAR
-    // Metadata for implicit sync
+#ifndef COMPILE_FOR_TRISC
+    // Metadata for implicit sync (DM only)
     uint16_t ptxn_id_loop_cnt_ = 0;
     uint8_t ptxn_id_index_ = 0;
     uint32_t ptiles_read_ = 0;  // running total of tiles read (32-bit so it never wraps in a launch)
@@ -551,6 +552,7 @@ private:
     uint32_t pshare_txn_id_ = 0;
     uint16_t cshare_pos_ = 0;
     uint32_t cshare_txn_id_ = 0;
+#endif
 #endif
 };
 
