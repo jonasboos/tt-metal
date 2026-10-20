@@ -428,6 +428,11 @@ size_t AllocatorImpl::get_num_allocated_buffers() const {
     return allocated_buffers_.size();
 }
 
+std::vector<std::pair<DeviceAddr, DeviceAddr>> AllocatorImpl::get_dram_allocations() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dram_manager_->get_allocated_ranges();
+}
+
 uint32_t AllocatorImpl::get_num_banks(const BufferType& buffer_type) const {
     // Don't lock mutex_ because the number of banks is a constant and does not change.
     switch (buffer_type) {

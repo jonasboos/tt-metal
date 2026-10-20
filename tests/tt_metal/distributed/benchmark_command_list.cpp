@@ -202,7 +202,7 @@ void BM_Replay(benchmark::State& state) {
     run_timed(state, [&] {
         const auto start = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < kBatch; ++i) {
-            EnqueueCommandList(cq, bench.list, /*blocking=*/false);
+            EnqueueCommandList(cq, bench.list, /*blocking=*/false, /*check_dram_overlap=*/false);
         }
         Finish(cq);
         return seconds_since(start);
@@ -224,7 +224,7 @@ void BM_PatchAndReplay(benchmark::State& state) {
         const auto start = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < kBatch; ++i) {
             bench.list.update_args(bench.patches[i % 2]);
-            EnqueueCommandList(cq, bench.list, /*blocking=*/false);
+            EnqueueCommandList(cq, bench.list, /*blocking=*/false, /*check_dram_overlap=*/false);
         }
         Finish(cq);
         return seconds_since(start);
