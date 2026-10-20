@@ -173,10 +173,32 @@ This fits every earlier observation: the same code, same image and same KMD/firm
 every host after the change; it is a fixed cost independent of resolution; it is Blackhole-galaxy
 specific (WH galaxy hosts are a different fleet); it is not C-states (spinners make it worse).
 
-**Still to confirm:** that the CI galaxy hosts have the same busy cores, and when Weka was rolled
-out to them. On this dev host it was 09-21; the CI pool's first slow run is 09-15 13:18 UTC.
-Probe E (below) checks per-CPU load on a CI host and runs the real perf test with 32 vs 64 torch
-threads.
+### Probe E: confirmed on a CI host
+
+Branch `jameslee/probe-60670-E-torch-threads`, run 39467552240, host `bh-glx-120-d04u08`,
+code `f8c4ce59dd0` plus a `TT_DIT_TORCH_THREADS` override in the conftest.
+
+| | 32 torch threads | 64 torch threads (default), same host |
+|---|---|---|
+| Per-CPU load (`/proc/stat`) | **CPU 1 and CPU 2 at 100%**, mean 3.9% | same |
+| 720p perf test VAE | **0.607 s, PASS** (target 0.85) | 1.02–1.05 s in every run since 09-15 |
+| 480p perf test VAE | none (first test on a cold host hit the 1800 s timeout) | **0.777 s, FAIL** (target 0.42) |
+
+Denoise (157 s at 720p) and text encoding (0.08 s) are unaffected. The CI host has the same two
+always-busy cores as the dev host. The container cannot see `/opt/weka`, so the Weka install date
+on the CI hosts is still unknown (the `/mnt/weka` mount point is dated 10-05 on both hosts, which is
+not the install date).
+
+### Fix
+
+Branch `jameslee/fix-60670-tt-dit-torch-threads` (off `main`, commit `221e1c81915`):
+`models/tt_dit/tests/conftest.py` sets torch to one thread per **physical** core in the process
+affinity (counting SMT siblings once) instead of `os.cpu_count()`. On these hosts that is 32.
+Validation run on bh_sc1: 39484292256 (full Wan T2V sc1 job: perf 480p/720p + 720p pipeline).
+
+**Open question for infra:** when the Weka client (busy-polling CPUs 1–2) was deployed to the
+`multihost-ci-sc1-*` galaxy hosts. The regression starts between 2026-09-14 03:33 and
+2026-09-15 13:18 UTC, across the 09-15 morning outage.
 
 **Asks:**
 
