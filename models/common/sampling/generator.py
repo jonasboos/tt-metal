@@ -412,7 +412,13 @@ class SamplingGenerator:
                 f"Sampling trace logits must have shape {expected + ('vocab',)}, got {tuple(logits.shape)}. "
                 "Pad logits to the configured sampling batch before preparing traces."
             )
-        return self._trace_token_outputs[self.tt_sampling.force_argmax_sampling]
+        force_argmax = self.tt_sampling.force_argmax_sampling
+        if force_argmax not in self._trace_token_outputs:
+            raise ValueError(
+                f"Sampling trace mode force_argmax_sampling={force_argmax} was not enabled at construction. "
+                "Use a supported mode or reinitialize the sampler before capturing traces."
+            )
+        return self._trace_token_outputs[force_argmax]
 
     def _validate_trace_inputs(self, slot, logits: ttnn.Tensor, tt_out_tok: Optional[ttnn.Tensor]):
         if slot["input"] is None or slot["output"] is None:

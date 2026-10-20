@@ -37,6 +37,14 @@ when `skip_precompile=True`. That flag does not make late allocation safe.
 Expanding the set requires releasing live traces and rebuilding the model and
 generator with the complete configuration.
 
+The Blackhole DRAM prefetcher follows the same preparation rule. Decode warmup
+uses its retained sub-device manager. Prefill uses the default manager and
+releases the large GCB so that prefill circular buffers can use L1. The first
+decode capture saves both GCB addresses. Later decode calls restore those
+addresses before replay. Only the reconstructed GCB allocations receive the
+corruption acknowledgement; persistent trace I/O remains protected. Decode
+output copies use the worker sub-device grid in both warmup and capture.
+
 This applies to the base text generator's prepared paths. Models that replace
 capture or warmup must prepare their own full set before delegating to these
 paths. The separate Galaxy generator and its GCB/prefetcher lifecycle require

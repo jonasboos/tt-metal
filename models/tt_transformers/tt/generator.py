@@ -628,11 +628,6 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
 
         The model has to be in decode mode for the compile pass to pick the right configs.
         """
-        # Gate lives here rather than only in _prepare_decode_trace_once because this function has a
-        # second caller that bypasses that wrapper. Returning None leaves _pending_decode_trace unset,
-        # which is exactly the "nothing hoisted" state the original path expects.
-        if self._uses_prefetcher():
-            return None
         if page_table is None:
             # Nothing here pins down the decode batch size, and guessing wrong would leave the trace inputs
             # the wrong shape for the first decode step. Fall back to setting it up lazily, as before.
@@ -648,10 +643,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         chunked_page_table = torch.chunk(page_table, self.data_parallel, 0)
 
         previous_mode = self.mode
+        prefetcher_modes = [
+            m.prefetcher.mode if getattr(m, "prefetcher", None) is not None else None for m in self.model
+        ]
         self.mode = Mode.DECODE
-        for i in range(len(self.model)):
-            self.model[i].switch_mode(Mode.DECODE)
         try:
+            for model in self.model:
+                model.switch_mode(Mode.DECODE)
             return self._prepare_decode_trace_text(
                 tokens,
                 current_pos,
@@ -660,12 +658,10 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 on_device_sampling=on_device_sampling,
             )
         finally:
-            # Restore only the generator's own mode. No switch_mode(Mode.PREFILL): that drives
-            # Prefetcher.init(), whose Mode.PREFILL branch has never run on main (main only ever calls
-            # switch_mode(Mode.DECODE)) and is not functional -- it reads an unassigned all_core_range_set,
-            # and supplying one trips "Statically allocated circular buffers ... clash with L1 buffers on
-            # core range". Leaving it in DECODE matches main.
             self.mode = previous_mode
+            for model, mode in zip(self.model, prefetcher_modes):
+                if mode is not None:
+                    model.switch_mode(mode)
 
     def _will_row_shard_prefill(self, tokens, sampling_params):
         """Whether this prefill will be dispatched to the model's row-sharded batched path.
@@ -690,26 +686,8 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         return type(self)._capture_trace_prefill is not Generator._capture_trace_prefill
 
     def _uses_prefetcher(self):
-        """Whether any model instance drives the DRAM prefetcher.
-
-        The prefetcher owns sub-device managers that differ per mode, so hoisting decode setup into the
-        prefill phase cannot work for it: switching to DECODE and back reaches the prefetcher's
-        Mode.PREFILL branch, which has never run on main and is not functional, while staying in DECODE
-        leaves prefill running against decode sub-devices ("Kernel group cores do not match sub device
-        cores", program.cpp:2205). The prefetcher is Blackhole-only and GPT-OSS does not use it, so
-        keeping these models on the original non-hoisted path costs this change nothing it targets.
-        """
-        uses = any(getattr(m, "prefetcher", None) is not None for m in self.model)
-        if uses and not getattr(self, "_logged_prefetcher_hoist_skip", False):
-            self._logged_prefetcher_hoist_skip = True
-            logger.info(
-                "DRAM prefetcher detected: keeping the original (non-hoisted) decode trace setup. "
-                "This model does not get the hoisted trace-allocation path, because the prefetcher's "
-                "per-mode sub-device managers are incompatible with preparing decode setup during the "
-                "prefill phase (see _uses_prefetcher). Trace I/O buffers for this model may still be "
-                "allocated while a trace is live."
-            )
-        return uses
+        """Whether any model instance drives the DRAM prefetcher."""
+        return any(getattr(model, "prefetcher", None) is not None for model in self.model)
 
     def _prepare_decode_trace_once(self, kv_cache, page_table, on_device_sampling):
         """Stage both decode modes before the first prefill capture.
@@ -717,7 +695,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         The prefill warmup sweep covers device and host sampling. Either decode
         mode may follow it; only the requested mode needs immediate capture.
         """
-        if self._uses_prefetcher() or page_table is None or self._pending_decode_trace is not None:
+        if page_table is None or self._pending_decode_trace is not None:
             return
         tokens = torch.chunk(torch.zeros(page_table.shape[0], 1, dtype=torch.int64), self.data_parallel, 0)
         variants = [on_device_sampling]
@@ -765,21 +743,26 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         """Capture the decode trace prepared while recording was deferred.
 
         Its compile pass, persistent inputs and sampling pre-compile all ran in
-        :meth:`_prepare_decode_trace_text` before this call's prefill captured anything, so this binds only
-        to buffers that already existed and allocates nothing itself.
+        :meth:`_prepare_decode_trace_text` before this call's prefill captured anything. Prefetcher models
+        also restore their decode manager and GCB before capture.
         """
         if self._pending_decode_trace is not None:
             prepared, self._pending_decode_trace = self._pending_decode_trace, None
             on_device_sampling = prepared["on_device_sampling"]
             previous_mode = self.mode
+            prefetcher_modes = [
+                m.prefetcher.mode if getattr(m, "prefetcher", None) is not None else None for m in self.model
+            ]
             self.mode = Mode.DECODE
-            for i in range(len(self.model)):
-                self.model[i].switch_mode(Mode.DECODE)
             try:
+                for model in self.model:
+                    model.switch_mode(Mode.DECODE)
                 trace_ids, tt_out_trace, *device_inputs = self._record_decode_trace_text(prepared)
             finally:
-                # See _prepare_decode_trace_for_warmup: no switch_mode(Mode.PREFILL) here either.
                 self.mode = previous_mode
+                for model, mode in zip(self.model, prefetcher_modes):
+                    if mode is not None:
+                        model.switch_mode(mode)
             self.trace_ids_decode[on_device_sampling] = trace_ids
             self.trace_inputs_decode[on_device_sampling] = device_inputs
             self.trace_output_decode[on_device_sampling] = tt_out_trace
@@ -1240,6 +1223,9 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         **kwargs,
     ):
         self.mode = Mode.PREFILL
+        for model in self.model:
+            if getattr(model, "prefetcher", None) is not None:
+                model.switch_mode(Mode.PREFILL)
         if page_table is not None:
             assert isinstance(page_table, torch.Tensor), "page_table mush be torch.Tensor"
         else:
@@ -1265,7 +1251,6 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 and not self._any_trace_captured()
                 and not self._will_row_shard_prefill(tokens, sampling_params)
                 and not self._overrides_prefill_capture()
-                and not self._uses_prefetcher()
             )
             if prepare_decode:
                 self._prepare_decode_trace_once(
@@ -2380,10 +2365,6 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         self, tokens, current_pos, page_table=None, kv_cache=None, on_device_sampling=False
     ):
         """Stage a decode variant during an eager warmup call, inside the model's input routing."""
-        if self._uses_prefetcher():
-            return self._decode_forward_no_trace_text(
-                tokens, current_pos, page_table=page_table, kv_cache=kv_cache, on_device_sampling=on_device_sampling
-            )
         key = self._decode_trace_key(on_device_sampling, tokens)
         if not hasattr(self, "_prepared_decode_traces"):
             self._prepared_decode_traces = {}
@@ -2458,7 +2439,12 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             # Even skip_precompile callers need the boundary-copy program warmed
             # with an explicit destination before capture. Use the persistent inputs
             # so auxiliary model stashes and program signatures match capture.
-            output = trace_io.prepare_output(self._decode_trace_forward(prepared, i), ("decode", i))
+            prefetcher = getattr(self.model[i], "prefetcher", None)
+            output = trace_io.prepare_output(
+                self._decode_trace_forward(prepared, i),
+                ("decode", i),
+                sub_core_grids=prefetcher.all_worker_cores_range_set if prefetcher is not None else None,
+            )
             prepared["outputs"].append(output)
             logits, log_probs = output if isinstance(output, tuple) else (output, None)
             compile_output.append((logits, log_probs))
@@ -2492,8 +2478,8 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
     def _record_decode_trace_text(self, prepared):
         """Phase 2 of decode trace setup: capture the trace.
 
-        Allocation-free outside the capture window -- it binds only to buffers allocated by
-        :meth:`_prepare_decode_trace_text`.
+        Binds the I/O buffers allocated by :meth:`_prepare_decode_trace_text`.
+        A prefetcher may restore its GCB before entering the capture window.
         """
         device_inputs = prepared["device_inputs"]
         prepared.pop("compile_output", None)
@@ -2502,12 +2488,19 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         tt_out_trace = []
         trace_ids = {}
         for i in range(self.data_parallel):
+            prefetcher = getattr(self.model[i], "prefetcher", None)
+            if prefetcher is not None:
+                prefetcher.prepare_trace()
             sampling_module = getattr(self.model[i], "sampling", None)
             sampling_trace_enabled = on_device_sampling and sampling_module is not None
             trace_id = ttnn.begin_trace_capture(self.model_args[i].mesh_device, cq_id=0)
             trace_ids[i] = trace_id
             tt_out_trace.append(
-                PreparedTraceIO.copy_output(self._decode_trace_forward(prepared, i), prepared["outputs"][i])
+                PreparedTraceIO.copy_output(
+                    self._decode_trace_forward(prepared, i),
+                    prepared["outputs"][i],
+                    sub_core_grids=prefetcher.all_worker_cores_range_set if prefetcher is not None else None,
+                )
             )
             ttnn.end_trace_capture(self.model_args[i].mesh_device, trace_id, cq_id=0)
 
@@ -2543,7 +2536,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             variant = param is not None
             if variant not in variants:
                 variants.append(variant)
-        if not variants or page_table is None or self._uses_prefetcher():
+        if not variants or page_table is None:
             return False
         if self.mode != Mode.DECODE:
             self.mode = Mode.DECODE
@@ -4275,6 +4268,12 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             return
         self._generator_capture_released = True
         try:
+            # Prefetcher prefill traces belong to the default manager. Select it
+            # without allocating a GCB during teardown.
+            for model in getattr(self, "model", []):
+                prefetcher = getattr(model, "prefetcher", None)
+                if prefetcher is not None:
+                    prefetcher.init(Mode.PREFILL)
             # Release prefill traces
             if hasattr(self, "trace_id_prefill"):
                 for trace_key, trace_id in self.trace_id_prefill.items():
@@ -4301,6 +4300,10 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                         except Exception:
                             pass
 
+            for model in getattr(self, "model", []):
+                prefetcher = getattr(model, "prefetcher", None)
+                if prefetcher is not None and prefetcher.init_decode_done:
+                    prefetcher.mesh_device.load_sub_device_manager(prefetcher.prefetcher_sub_device.manager_id)
             # Release all sampling traces, including every decode-bucket namespace.
             for model in getattr(self, "model", []):
                 sampling_module = getattr(model, "sampling", None)
