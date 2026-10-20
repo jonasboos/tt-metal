@@ -50,6 +50,26 @@ class _LogStartPlugin:
         print(f"\n\n{'━' * width}\n{label}\n", flush=True)  # noqa: T201
 
 
-num_torch_threads = max(1, os.cpu_count())
+def _physical_cores_in_affinity() -> int:
+    """Number of physical cores this process may run on (SMT siblings counted once)."""
+    try:
+        cpus = os.sched_getaffinity(0)
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+    cores = set()
+    for cpu in cpus:
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+                cores.add(f.read().strip())
+        except OSError:
+            cores.add(str(cpu))
+    return max(1, len(cores))
+
+
+# One torch thread per physical core, not per logical CPU. With one OpenMP thread per logical CPU,
+# every parallel region waits for the threads that share a core with any other busy process. On the
+# BH galaxy hosts the Weka client pins two polling threads at 100% on CPUs 1 and 2, which made each of
+# the 32 small copies in the Wan VAE readback (_reassemble_2d) stall: +0.4 s per VAE pass (#60670).
+num_torch_threads = _physical_cores_in_affinity()
 logger.info(f"Setting torch num_threads to {num_torch_threads}")
 torch.set_num_threads(num_torch_threads)
