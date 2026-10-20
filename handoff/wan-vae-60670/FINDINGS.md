@@ -33,6 +33,24 @@ superseded.
 - The probe A denoise time (39.5 s at 480p vs about 57 s on 09-14) also differs by host, matching
   the bimodal runner behaviour noted in the issue.
 
+### Probe A-HP: same code on the 14 kW (`bh_sc1_high_power`) pool, 2026-10-20
+
+Branch `jameslee/probe-60670-A-hp-f8c4ce59dd0` (`f8c4ce59dd0` plus two lines that route only the
+Wan T2V sc1 job to `bh_sc1_high_power`). Run 39341458236, job 118369560488, host `bh-glx-120-d07u08`
+(runner `multihost-ci-sc1-hp-*`), KMD 2.11.0, firmware 19.16.0, AICLK settled at 1343 MHz.
+
+| Test | 09-14 good (`bh_sc1`) | Probe A (`bh_sc1`, 10-17) | **Probe A-HP (14 kW, 10-20)** |
+|---|---|---|---|
+| perf 480p VAE | 0.324 s | 0.752 s | timeout (1770 s, first-run compile on a fresh host) |
+| perf 720p VAE | 0.676 s | 1.021 s | **0.972 s** |
+| pipeline 720p `[>>] vae` section | 0.655 s | n/a | **0.984 s** |
+| perf 720p denoise | 157.2 s | 125.9 s | 123.9 s |
+
+**The high-power pool does not restore the old VAE time.** It is at most about 5% better than the
+regular pool and still about 45% slower than 09-14. Power class (8 kW vs 14 kW) is therefore not
+the explanation. tt-train's MFU gap between the pools (#56782) is real, but it is a different
+effect.
+
 **Asks:**
 
 1. CI/infra: what changed on the BH sc1 (`multihost-ci-sc1-*`) machines on 2026-09-14/15?
