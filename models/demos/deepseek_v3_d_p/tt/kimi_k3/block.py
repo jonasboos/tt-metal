@@ -66,6 +66,8 @@ class TtKimiK3Block(LightweightModule):
         shared_expert_weights_dtype=ttnn.bfloat8_b,
         routing_use_l1_small_for_semaphores: bool = False,
         overlap_shared_expert_with_dispatch: bool = True,
+        moe_transport: str = "direct",
+        overlap_routed_expert_with_combine: Optional[bool] = None,
     ):
         super().__init__()
         self.mesh_device = mesh_device
@@ -141,6 +143,8 @@ class TtKimiK3Block(LightweightModule):
                 routing_use_l1_small_for_semaphores=routing_use_l1_small_for_semaphores,
                 is_balanced=is_balanced,
                 overlap_shared_expert_with_dispatch=overlap_shared_expert_with_dispatch,
+                moe_transport=moe_transport,
+                overlap_routed_expert_with_combine=overlap_routed_expert_with_combine,
             )
         else:
             # Layer 0 only, under first_k_dense_replace=1. K3 runs SiTU here, not SiLU (#53625).

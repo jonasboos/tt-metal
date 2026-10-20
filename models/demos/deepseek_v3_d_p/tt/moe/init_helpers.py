@@ -38,17 +38,31 @@ def combine_overlap_payload_size(routed_emb_dim: int) -> int:
     return routed_emb_dim + CMB_FABRIC2D_ROUTING_INFO_BYTES
 
 
-def moe_fabric_payload_size(model_cfg) -> int:
-    """The fabric payload to open a mesh with for a model whose MoE is TtMoe.
+def dispatch_fabric2d_packet_bytes(routed_emb_dim: int) -> int:
+    """The fabric payload dispatch_fabric2d needs: it sends a whole bfloat16 token, padded to the 64 B DRAM
+    alignment, with its routing tail in one packet."""
+    token_page_bytes = -(-routed_emb_dim * 2 // 64) * 64
+    return token_page_bytes + CMB_FABRIC2D_ROUTING_INFO_BYTES
+
+
+def moe_fabric_payload_size(model_cfg, moe_transport: str = "direct") -> int:
+    """The fabric payload to open a mesh with for a model whose MoE is TtMoe with this moe_transport.
 
     On Blackhole TtMoe overlaps the routed expert with combine_fabric2d, so the mesh needs room for half a bf16
     token plus combine's routing tail. Everywhere else TtMoe runs the routed expert then combine as separate ops, and
     the model's own FABRIC_PAYLOAD_SIZE stands. TtMoe reads the payload back to decide whether to overlap, so a
-    mesh opened any other way simply runs without it. Deferred to avoid probing hardware at import time.
+    mesh opened any other way simply runs without it. moe_transport "fabric2d" also needs room for a whole routed
+    token, which dispatch_fabric2d sends in one packet. No larger than needed: a larger max packet can leave the
+    fabric routers fewer buffer slots, which every fabric op pays for. Deferred to avoid probing hardware at import
+    time.
     """
+    payload = model_cfg.FABRIC_PAYLOAD_SIZE
     if is_blackhole():
-        return max(model_cfg.FABRIC_PAYLOAD_SIZE, combine_overlap_payload_size(model_cfg.EMB_SIZE))
-    return model_cfg.FABRIC_PAYLOAD_SIZE
+        payload = max(payload, combine_overlap_payload_size(model_cfg.EMB_SIZE))
+    if moe_transport == "fabric2d":
+        routed_emb_dim = getattr(model_cfg, "ROUTED_EXPERT_HIDDEN_SIZE", None) or model_cfg.EMB_SIZE
+        payload = max(payload, dispatch_fabric2d_packet_bytes(routed_emb_dim))
+    return payload
 
 
 @dataclass
@@ -356,7 +370,8 @@ def get_gate_outputs(
     to a group are zeroed out.
 
     Args:
-        indices: Expert indices tensor (dispatch_group_size, seq_len_per_chip, num_experts_per_tok)
+        indices: Expert indices tensor (dispatch_group_size, seq_len_per_chip, num_experts_per_tok).
+            An entry equal to num_routed_experts marks a padded token and is not counted.
         dispatch_group_size: Number of chips in each dispatch group
         num_routed_experts: Total number of routed experts across all chips
         experts_per_chip: Number of experts per chip
@@ -399,7 +414,9 @@ def get_gate_outputs(
         for token in range(seq_len_per_chip):
             for topk_idx in range(num_experts_per_tok):
                 routed_expert = indices[chip, token, topk_idx]
-                expert_counter_dense[chip, routed_expert] += 1
+                # num_routed_experts marks a padded token, which goes to no expert.
+                if routed_expert != num_routed_experts:
+                    expert_counter_dense[chip, routed_expert] += 1
 
     # Create group masks from dispatch table: (num_dispatch_groups, 1, num_routed_experts)
     group_masks = (expert_dispatch_table >= 0).unsqueeze(1).to(torch.int32)

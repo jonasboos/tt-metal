@@ -57,10 +57,13 @@ def unwrap_multimodal_config(cfg):
 class MLAPrefillAdapter(PrefillModelAdapter):
     """DeepSeek-V3-family prefill adapter (MLA + MoE over TtPrefillRuntime)."""
 
-    def fabric_payload_size(self) -> int:
+    # fabric2d_contract.MOE_TRANSPORTS, copied so importing the adapters stays cheap.
+    moe_transports = ("direct", "fabric2d")
+
+    def fabric_payload_size(self, moe_transport: str = "direct") -> int:
         from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import moe_fabric_payload_size
 
-        return moe_fabric_payload_size(self.model_config)
+        return moe_fabric_payload_size(self.model_config, moe_transport)
 
     # ------------------------------------------------------------------
     # HF config
@@ -160,6 +163,8 @@ class MLAPrefillAdapter(PrefillModelAdapter):
             sparse_kv_cache_format=self.resolve_sparse_kv_cache_format(params.sparse_kv_cache_format),
             use_trace=params.use_trace,
             overlap_shared_expert_with_dispatch=params.overlap_shared_expert_with_dispatch,
+            moe_transport=params.moe_transport,
+            overlap_routed_expert_with_combine=params.overlap_routed_expert_with_combine,
             tp_shard_kv=True if self._dense_tp_shard_kv(params) else None,
         )
         return TtPrefillRuntime(

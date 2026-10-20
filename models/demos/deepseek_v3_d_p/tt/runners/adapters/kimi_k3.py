@@ -341,6 +341,8 @@ class KimiK3Adapter(MLAPrefillAdapter):
             sparse_kv_cache_format=self.resolve_sparse_kv_cache_format(params.sparse_kv_cache_format),
             use_trace=params.use_trace,
             overlap_shared_expert_with_dispatch=params.overlap_shared_expert_with_dispatch,
+            moe_transport=params.moe_transport,
+            overlap_routed_expert_with_combine=params.overlap_routed_expert_with_combine,
             tp_shard_kv=True if self._dense_tp_shard_kv(params) else None,
         )
         return TtKimiK3Runtime(

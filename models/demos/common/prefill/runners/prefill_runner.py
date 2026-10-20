@@ -133,6 +133,16 @@ if MTP_LEVELS:
     _L1_SMALL_SIZE += 512
 USE_TRACE = os.environ.get("PREFILL_USE_TRACE", "0") == "1"
 _TRACE_REGION_SIZE = int(os.environ.get("PREFILL_TRACE_REGION_SIZE", 256 * 1024 * 1024)) if USE_TRACE else 0
+# TtMoe's moe_transport and overlap_routed_expert_with_combine; an unset PREFILL_OVERLAP_ROUTED_EXPERT keeps
+# TtMoe's choice.
+MOE_TRANSPORT = os.environ.get("PREFILL_MOE_TRANSPORT", "direct").strip().lower()
+assert (
+    MOE_TRANSPORT in ADAPTER.moe_transports
+), f"PREFILL_MOE_TRANSPORT={MOE_TRANSPORT!r}: model {ADAPTER.name!r} supports {ADAPTER.moe_transports}"
+_OVERLAP_ROUTED_EXPERT_ENV = os.environ.get("PREFILL_OVERLAP_ROUTED_EXPERT", "").strip()
+if _OVERLAP_ROUTED_EXPERT_ENV not in ("", "0", "1"):
+    raise ValueError(f"PREFILL_OVERLAP_ROUTED_EXPERT must be 0, 1 or unset, got {_OVERLAP_ROUTED_EXPERT_ENV!r}")
+OVERLAP_ROUTED_EXPERT = None if _OVERLAP_ROUTED_EXPERT_ENV == "" else _OVERLAP_ROUTED_EXPERT_ENV == "1"
 
 assert not (MTP_LEVELS and DFLASH_ENABLED), "PREFILL_MTP_LEVELS>0 and PREFILL_DFLASH=1 are mutually exclusive"
 
@@ -632,6 +642,8 @@ def _print_config() -> None:
         ("PREFILL_MTP_LEVELS", f"{MTP_LEVELS} (adapter.supports_mtp={ADAPTER.supports_mtp})"),
         ("PREFILL_USE_TRACE", f"{USE_TRACE} (trace_region={_TRACE_REGION_SIZE >> 20} MB)"),
         ("PREFILL_TP_SHARD_KV", str(TP_SHARD_KV)),
+        ("PREFILL_MOE_TRANSPORT", f"{MOE_TRANSPORT} (adapter.moe_transports={ADAPTER.moe_transports})"),
+        ("PREFILL_OVERLAP_ROUTED_EXPERT", _OVERLAP_ROUTED_EXPERT_ENV or "unset"),
         ("PREFILL_LAYER_ACK_D2H", os.environ.get("PREFILL_LAYER_ACK_D2H", "0")),
         ("PREFILL_CHUNK_SIZE", str(CHUNK_SIZE)),
         ("PREFILL_MAX_SEQ_LEN", str(MAX_SEQ_LEN)),
@@ -674,6 +686,8 @@ def _assert_ranks_agree_on_config(rank: int, num_ranks: int) -> None:
         "mtp_levels": MTP_LEVELS,
         "PREFILL_ENABLE_MIGRATION": migration_publish_enabled(),
         "PREFILL_MIGRATION_EXPORT_TO_FILE": migration_file_export_enabled(),
+        "moe_transport": MOE_TRANSPORT,
+        "overlap_routed_expert": OVERLAP_ROUTED_EXPERT,
     }
     fingerprint = "|".join(f"{k}={v}" for k, v in fields.items())
     digest = zlib.crc32(fingerprint.encode()) & 0x7FFFFFFF
@@ -718,7 +732,7 @@ def main() -> None:
 
     mesh_device = open_mesh_device(
         GLOBAL_MESH_SHAPE,
-        ADAPTER.fabric_payload_size(),
+        ADAPTER.fabric_payload_size(MOE_TRANSPORT),
         l1_small_size=_L1_SMALL_SIZE,
         trace_region_size=_TRACE_REGION_SIZE,
     )
@@ -748,6 +762,8 @@ def main() -> None:
         sparse_kv_cache_format=ADAPTER.default_sparse_kv_cache_format,
         use_trace=USE_TRACE,
         overlap_shared_expert_with_dispatch=os.environ.get("PREFILL_OVERLAP_SHARED_EXPERT", "1") == "1",
+        moe_transport=MOE_TRANSPORT,
+        overlap_routed_expert_with_combine=OVERLAP_ROUTED_EXPERT,
     )
 
     runtime = ADAPTER.build_runtime(mesh_device=mesh_device, hf_config=hf_config, params=params)

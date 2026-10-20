@@ -17,10 +17,11 @@ from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import (
 )
 
 
-def moe_fabric_payload(model_config):
+def moe_fabric_payload(model_config, moe_transport="direct"):
     """The payload for a mesh running TtMoe: room for the routed expert / combine overlap on Blackhole, the
-    model's own FABRIC_PAYLOAD_SIZE everywhere else. See init_helpers.moe_fabric_payload_size."""
-    return moe_fabric_payload_size(model_config)
+    model's own FABRIC_PAYLOAD_SIZE everywhere else, and a whole routed token for moe_transport "fabric2d".
+    See init_helpers.moe_fabric_payload_size."""
+    return moe_fabric_payload_size(model_config, moe_transport)
 
 
 def fabric2d_device_params(*, fabric_payload_size=None, **overrides) -> dict:

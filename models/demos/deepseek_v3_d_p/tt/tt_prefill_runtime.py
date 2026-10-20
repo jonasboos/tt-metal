@@ -107,6 +107,10 @@ class TtPrefillRuntimeConfig:
     # ~2*(MoE layers) host load/clear round-trips per replay. Set False (PREFILL_OVERLAP_SHARED_EXPERT=0) to
     # capture the forward as ONE trace segment (no per-chunk swaps -> faster replay); costs the overlap.
     overlap_shared_expert_with_dispatch: bool = True
+    # TtMoe's moe_transport and overlap_routed_expert_with_combine (PREFILL_MOE_TRANSPORT,
+    # PREFILL_OVERLAP_ROUTED_EXPERT). None keeps TtMoe's choice of overlap.
+    moe_transport: str = "direct"
+    overlap_routed_expert_with_combine: Optional[bool] = None
     # KV dedup, must match the cache allocation. None: sparse dedups, dense does not.
     tp_shard_kv: Optional[bool] = None
 
@@ -289,6 +293,8 @@ class TtPrefillRuntime:
             is_last_rank=self.config.is_last_rank,
             sparse_kv_cache_format=self.config.sparse_kv_cache_format,
             overlap_shared_expert_with_dispatch=self.config.overlap_shared_expert_with_dispatch,
+            moe_transport=self.config.moe_transport,
+            overlap_routed_expert_with_combine=self.config.overlap_routed_expert_with_combine,
             mtp_predictor=self.mtp_predictor,
             tp_shard_kv=self.config.tp_shard_kv,
         )
@@ -368,6 +374,8 @@ class TtPrefillRuntime:
             routing_use_l1_small_for_semaphores=self.config.routing_use_l1_small_for_semaphores,
             sparse_kv_cache_format=self.config.sparse_kv_cache_format,
             overlap_shared_expert_with_dispatch=self.config.overlap_shared_expert_with_dispatch,
+            moe_transport=self.config.moe_transport,
+            overlap_routed_expert_with_combine=self.config.overlap_routed_expert_with_combine,
             weight_cache_path=mtp_cache_path,
             cache_name_prefix=MTP_CACHE_PREFIX,
             first_layer_idx=self.config.first_layer_idx,

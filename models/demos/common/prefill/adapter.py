@@ -80,6 +80,10 @@ class PrefillRunParams:
     # MoE shared-expert ∥ dispatch overlap (default on). Off => single-segment trace (no per-chunk
     # sub-device swaps), faster replay at the cost of the overlap. See TtPrefillRuntimeConfig.
     overlap_shared_expert_with_dispatch: bool = True
+    # TtMoe's moe_transport (one of PrefillModelAdapter.moe_transports) and overlap_routed_expert_with_combine
+    # (None keeps TtMoe's choice). Models whose MoE is not TtMoe accept only "direct" and ignore the overlap.
+    moe_transport: str = "direct"
+    overlap_routed_expert_with_combine: Optional[bool] = None
     # Build the DFlash drafter context-KV cache during prefill. Opt-in / default False so adding this
     # feature never breaks existing PrefillRunParams constructors (which need not pass it); the runner
     # derives it from the model capability (supports_dflash) + PREFILL_DFLASH + a drafter checkpoint.
@@ -145,10 +149,13 @@ class PrefillModelAdapter(ABC):
     supports_mtp: bool = False
     supports_tp_shard_kv: bool = False
     tp_shard_kv_default: bool = False
+    # The PrefillRunParams.moe_transport values this model honours; the runner refuses any other.
+    moe_transports: tuple[str, ...] = ("direct",)
 
-    def fabric_payload_size(self) -> int:
+    def fabric_payload_size(self, moe_transport: str = "direct") -> int:
         """The fabric packet payload the mesh is opened with. It is fixed at mesh open, before the model is
-        built, so a model whose ops need more room than ``model_config.FABRIC_PAYLOAD_SIZE`` returns it here."""
+        built, so a model whose ops need more room than ``model_config.FABRIC_PAYLOAD_SIZE`` returns it here.
+        ``moe_transport`` is PrefillRunParams.moe_transport, one of ``moe_transports``."""
         return self.model_config.FABRIC_PAYLOAD_SIZE
 
     def cache_kind(self, config_id: int) -> str:
