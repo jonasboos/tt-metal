@@ -7,11 +7,12 @@ The functional drivers sample a few thousand points from an op's *safe* domain. 
 measured that way describes the sample, not the format, and cannot see a tail the sample
 never reaches. This module measures the format's number.
 
-Exhaustive is only honest for the 16-bit formats. bfloat16 has 65,279 finite values and
-float16 63,487, so either fits one 64-tile device run; Float32's 2**32 does not, so it is
-walked with a stride that gives every binade an equal share. ``Bfp8_b`` and ``Bfp4_b``
-are swept in bfloat16 and packed on the way in -- neither has an enumerable value set of
-its own.
+Exhaustive is only honest for the 16-bit formats. bfloat16 has 65,025 normal values
+(zero included) and float16 61,441, so either fits one 64-tile device run; Float32's 2**32
+does not, so it is walked with a stride that gives every binade an equal share. The
+subnormals are not fed at all: the unpack path flushes them, and a golden that does not
+would be measuring the flush rather than the op. ``Bfp8_b`` and ``Bfp4_b`` are swept in
+bfloat16 and packed on the way in -- neither has an enumerable value set of its own.
 """
 
 from __future__ import annotations
@@ -148,39 +149,45 @@ def swept_value_count(input_format: DataFormat) -> int:
     fmt = stimuli_format_for(input_format)
     stride = _stride_for(input_format)
     return int(
-        _enumerate_representable(fmt, -_INF, _INF, _SWEEP_TENSOR, stride=stride).numel()
+        _enumerate_representable(
+            fmt, -_INF, _INF, _SWEEP_TENSOR, stride=stride, normal_only=True
+        ).numel()
     )
 
 
 def sweep_spec(input_format: DataFormat) -> StimuliSpec:
-    """Every finite representable value of the stimuli format, once -- or, for float32,
-    every ``_FP32_STRIDE``-th, since 2**32 values do not fit one run.
+    """Every normal representable value of the stimuli format and its zero, once -- or,
+    for float32, every ``_FP32_STRIDE``-th, since 2**32 values do not fit one run. No
+    subnormal is fed: the unpack path flushes it, so a lane there would measure the
+    flush, not the op.
 
     Deliberately not clipped to the op's domain. ``exclude_undefined`` expresses a domain
     as ``intervals``, which ULP_SWEEP does not read -- and clipping would also stop the
     undefined inputs reaching hardware at all. They are swept and then masked out of the
     statistics by :func:`measurable_mask`, so the run still exercises them.
     """
-    return StimuliSpec.ulp_sweep(low=-_INF, high=_INF, stride=_stride_for(input_format))
+    return StimuliSpec.ulp_sweep(
+        low=-_INF, high=_INF, stride=_stride_for(input_format), normal_only=True
+    )
 
 
 def padding_lanes(src: torch.Tensor, input_format: DataFormat) -> torch.Tensor:
     """The tail ``generate_full_tensor`` fills with zeros to reach the tile count.
 
-    The sweep enumerates every finite value of the stimuli format -- 65,279 for
-    bfloat16, 63,487 for float16 -- into a fixed 65,536-lane tensor, so the last 257
-    (or 2,049) lanes are padding rather than data. They are not values the sweep chose
-    to feed, and they are all the same one, so they belong in no statistic: they
-    inflate every lane count, and on an op singular at zero they land on the pole:
-    ``reciprocal`` returns ``Inf`` there, golden and hardware alike, so the lanes are
-    not a mismatch but they are 257 copies of one value the sweep never chose.
+    The sweep enumerates every normal value of the stimuli format and its zero --
+    65,025 for bfloat16, 61,441 for float16 -- into a fixed 65,536-lane tensor, so the
+    last 511 (or 4,095) lanes are padding rather than data. They are not values the
+    sweep chose to feed, and they are all the same one, so they belong in no
+    statistic: they inflate every lane count, and on an op singular at zero they land
+    on the pole: ``reciprocal`` returns ``Inf`` there, golden and hardware alike, so the
+    lanes are not a mismatch but they are 511 copies of one value the sweep never chose.
 
     Identified by position rather than by value, because ``0.0`` is also a legitimate
     swept value: exactly one, in the middle of the sorted order. Confirmed on hardware
     that the padding is the contiguous tail.
 
     Counted by :func:`swept_value_count`, not by how many values the format has: a
-    strided float32 walk generates 65,280 of 2**32, and asking the format would put the
+    strided float32 walk generates 65,024 of 2**32, and asking the format would put the
     padding boundary past the end of the tensor and mask nothing.
     """
     swept = swept_value_count(input_format)
@@ -339,7 +346,9 @@ def _normal_input(
 ) -> torch.Tensor:
     """Lanes whose input survives the unpack: zero, or at least the smallest normal of
     the stimuli format *and* of the format the unpacker writes, and no larger than that
-    format can hold. The unpack format matters once:
+    format can hold. The sweep feeds no subnormal of the stimuli format
+    (:func:`sweep_spec`), so that cutoff only ever bites on a value the block-float
+    quantizer makes subnormal (below). The unpack format matters once:
     a Float32 input into a Float16 output at ``dest_acc=No`` unpacks into a Float16
     Dest, which flushes everything below 2**-14 -- a Float32 input's own cutoff is
     1.18e-38, so the strided lanes in between scored ``f(x)`` against ``f(0)`` as op
@@ -405,14 +414,15 @@ def measurable_mask(
       budget says, so ranking them would inflate the number without tightening the gate.
       One such lane is worth ~48,000 steps.
     * the sweep's own zero padding -- see :func:`padding_lanes`.
-    * subnormal inputs, as generated or as the block-float quantizer hands them to the
-      golden (:func:`_normal_input`). The hardware flushes them on the way in and the
-      golden does not, so ``ceil(5.69e-39)`` is 1 in the model and 0 on silicon --
-      16,129 bf16 steps for a difference that is the unpack path's flush, not the op's
-      accuracy. Measured, it is the whole of Ceil's, Floor's and Sqrt's apparent error:
-      excluding it returns all three to the 0 their exactness claims, and moves nothing
-      else. The flush is covered on its own terms elsewhere; a step count is the wrong
-      instrument for it. The same boundary has a top on a narrower unpack: a Float32
+    * inputs the unpack flushes, as the block-float quantizer hands them to the golden
+      (:func:`_normal_input`). The sweep feeds no subnormal of its own -- the hardware
+      flushes them on the way in and the golden does not, so ``ceil(5.69e-39)`` was 1
+      in the model and 0 on silicon, 16,129 bf16 steps for a difference that is the
+      unpack path's flush, not the op's accuracy, and the whole of Ceil's, Floor's and
+      Sqrt's apparent error -- but a ``Bfp8_b`` block's shared exponent can still make
+      a swept normal subnormal on the way in. The flush is covered on its own terms
+      elsewhere; a step count is the wrong instrument for it. The same boundary has a
+      top on a narrower unpack: a Float32
       input into a Float16 output at ``dest_acc=No`` lands in a Float16 Dest, which
       flushes below 2**-14 and *saturates* past 65504 -- about 44% of the strided lanes,
       whose golden sees the value as fed. Saturation, not a flush, and not the op's.

@@ -8,9 +8,10 @@ The functional drivers in test_eltwise_unary_sfpu.py sample a few thousand point
 an op's safe domain, so a budget measured that way can only ever be re-confirmed by
 them: it cannot see a tail the sample never reaches.
 
-One device run per variant covers the whole format: 65,279 finite bfloat16 values or
-63,487 float16 ones, in 64 tiles. ``Bfp8_b`` is swept in bfloat16 and packed on the way
-in; a ``Float32`` input has 2**32 values, so it is walked with a stride instead.
+One device run per variant covers the whole format: 65,025 normal bfloat16 values (and
+zero) or 61,441 float16 ones, in 64 tiles; subnormals are not fed, since the unpack
+flushes them. ``Bfp8_b`` is swept in bfloat16 and packed on the way in; a ``Float32``
+input has 2**32 values, so it is walked with a stride instead.
 Marked ``accuracy``, which every LLK workflow deselects, so it runs only by name or with
 ``-m accuracy``. Run it as a gate::
 

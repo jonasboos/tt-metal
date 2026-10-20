@@ -4,10 +4,11 @@ Every SFPU op declares how closely its output must match its golden, in
 `python_tests/helpers/sfpu_accuracy_budget.yaml`. For most ops that declaration is a
 tolerance. For the ops enrolled here it is a **step budget**: "every element is within
 N representable values of the reference". Most unary budgets come from the exhaustive
-sweep, which checks an op against *every distinct finite value of a 16-bit input format*
--- `±inf` and NaN are never fed, and `-0.0` is the same value as `+0.0` -- or, for
-`Float32`, a strided sample of 65,280 across the whole range (`ulp_sweep.is_exhaustive`
-tells the two apart). The exceptions are the `Signbit`, isinf/isnan and threshold-family
+sweep, which checks an op against *every normal value of a 16-bit input format* and its
+zero -- `±inf`, NaN and the subnormals are never fed (the unpack flushes a subnormal, so a
+lane there would measure the flush rather than the op), and `-0.0` is the same value as
+`+0.0` -- or, for `Float32`, a strided sample of 65,024 across the whole range
+(`ulp_sweep.is_exhaustive` tells the two apart). The exceptions are the `Signbit`, isinf/isnan and threshold-family
 rows, measured on their functional drivers' hand-built stimuli (`MEASURED_ON_SWEEP`, after
 the format table below). The isinf/isnan sweep feeds `±inf` and NaN on purpose.
 
@@ -62,8 +63,8 @@ is the format's.
 
 | format | as input | as output | how |
 |---|---|---|---|
-| `Float16_b` | yes | yes | all 65,279 finite values |
-| `Float16` | yes | yes | all 63,487 finite values |
+| `Float16_b` | yes | yes | all 65,025 normal values, and zero |
+| `Float16` | yes | yes | all 61,441 normal values, and zero |
 | `Bfp8_b` | yes | yes | swept in bfloat16, packed on the way in |
 | `Bfp4_b` | yes | **no** | swept in bfloat16, packed on the way in |
 | `Float32` | yes | yes | **strided**, not exhaustive — see below |
@@ -107,13 +108,12 @@ keeps only the lanes the op *claims* (below):
   format *and* of the format the unpacker writes, or past the latter's largest value
   where its exponent range is narrower: a Float32 input into a `Float16` output at
   `dest_acc=No` lands in a `Float16` Dest, which flushes below 2**-14 and saturates past
-  65504 (about 44% of the strided lanes). Subnormal inputs are the first case: the
-  hardware flushes them and the golden does not, so
-  `ceil(5.69e-39)` is 1 in the model and 0 on silicon: 16,129 bfloat16 steps. Measured,
-  that class alone was the whole of `Ceil`'s, `Floor`'s and `Sqrt`'s apparent error.
-  Judged on the input as generated *and* as the block-float quantizer hands it to the
-  golden: the sweep's one `-0.0` shares a `Bfp8_b` block with the bfloat16 subnormals
-  beside it and quantizes to `-2**-127`, so `floor` read -1 there against silicon's 0;
+  65504 (about 44% of the strided lanes). The sweep feeds no subnormal of its own --
+  the hardware flushes them and the golden does not, so `ceil(5.69e-39)` read 1 in the
+  model and 0 on silicon, 16,129 bfloat16 steps, once the whole of `Ceil`'s, `Floor`'s
+  and `Sqrt`'s apparent error -- but a `Bfp8_b` block's shared exponent can still make
+  a swept normal subnormal on the way in, so the input is judged as the block-float
+  quantizer hands it to the golden as well as as generated;
 - **answers the Dest lost** (`dest_holds`) — a `Float16` input runs on an fp16 Dest,
   which tops out at 65504 and flushes below 2^-14 whatever the output. Under a `Float32`
   or `Float16_b` output the hardware hands back 65536 (or NaN) where the answer was
@@ -127,8 +127,8 @@ keeps only the lanes the op *claims* (below):
   #54770 answers -1 or -131008 where the golden is 131008. Only where the Dest
   is narrower than the output; under an fp16 output the two overflow together and that
   is judged as an output overflow;
-- **the sweep's own zero padding** — the tensor is 65,536 lanes and bfloat16 has 65,279
-  finite values, so the last 257 are padding rather than data.
+- **the sweep's own zero padding** — the tensor is 65,536 lanes and bfloat16 has 65,025
+  normal values and zero, so the last 511 are padding rather than data.
 
 The second kind is a *failure*, not a non-question: it is dropped from the ranking only
 because `nonfinite_failures` reports it, over the same claimed lanes.

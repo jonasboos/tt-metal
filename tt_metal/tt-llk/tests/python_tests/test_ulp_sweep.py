@@ -582,19 +582,20 @@ def test_a_golden_past_the_output_range_is_not_a_nonfinite_failure():
 
 
 def test_the_sweeps_own_zero_padding_is_not_data():
-    """`generate_full_tensor` pads to the tile count, so the last 257 bf16 lanes are
+    """`generate_full_tensor` pads to the tile count, so the last 511 bf16 lanes are
     zeros the sweep never chose to feed. They inflate every lane count, and on an op
-    singular at zero they land on the pole -- 257 copies of one value nobody chose. Both
+    singular at zero they land on the pole -- 511 copies of one value nobody chose. Both
     masks drop them by position, for every op, whatever its singularities say.
 
     By position, not by value: one legitimate `0.0` is swept, in the middle.
     """
-    from helpers.stimuli_generator.strategies.structured import ulp_sweep_value_count
-    from helpers.ulp_sweep import padding_lanes
+    from helpers.ulp_sweep import padding_lanes, swept_value_count
 
     fmt = DataFormat.Float16_b
-    swept = ulp_sweep_value_count(fmt, float("-inf"), float("inf"))
-    pad_lanes = 257
+    swept = swept_value_count(fmt)
+    pad_lanes = (
+        2**16 - 65025
+    )  # the 254 subnormals are not fed, nor the inf/NaN patterns
     src = torch.zeros(swept + pad_lanes, dtype=torch.bfloat16)
     pad = padding_lanes(src, fmt)
     assert int(pad.sum()) == pad_lanes
@@ -1182,9 +1183,10 @@ def test_the_sweep_tile_count_holds_every_swept_value():
 
 
 #: The Float32 walk's sample count, written down independently of the code that makes
-#: it: one sample per finite bfloat16 bit pattern, 2**16 less the 256 inf/NaN ones.
-#: (65,279 distinct bf16 *values*: -0.0 and +0.0 are two cells but one value.)
-_FLOAT32_WALK_SAMPLES = 65280
+#: it: one sample per normal bfloat16 bit pattern, 2**16 less the 256 inf/NaN cells and
+#: the 256 subnormal ones, which the sweep does not feed. (65,025 distinct normal bf16
+#: *values* and zero: -0.0 and +0.0 are two cells but one value.)
+_FLOAT32_WALK_SAMPLES = 65024
 
 
 def test_the_float32_walk_is_pinned_end_to_end():
@@ -1205,9 +1207,17 @@ def test_the_float32_walk_is_pinned_end_to_end():
     lanes = sweep.SWEEP_TILE_COUNT * TILE_DIMENSIONS[0] * TILE_DIMENSIONS[1]
     assert _SWEEP_TENSOR == lanes
     walk = _enumerate_representable(
-        DataFormat.Float32, -math.inf, math.inf, _SWEEP_TENSOR, stride=_FP32_STRIDE
+        DataFormat.Float32,
+        -math.inf,
+        math.inf,
+        _SWEEP_TENSOR,
+        stride=_FP32_STRIDE,
+        normal_only=True,  # as sweep_spec walks it: no subnormal is fed
     )
     assert walk.numel() == _FLOAT32_WALK_SAMPLES
+    assert not bool(
+        ((walk != 0) & (walk.abs() < torch.finfo(torch.float32).tiny)).any()
+    )
     assert swept_value_count(DataFormat.Float32) == walk.numel()
     assert float(walk.min()) == -torch.finfo(torch.float32).max
     assert float(walk.max()) > 3.39e38
