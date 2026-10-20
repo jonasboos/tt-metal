@@ -47,6 +47,8 @@ _TIMING_SAMPLES = 5
 _LOUDBOX_PERF_SKU = "bh_loudbox"
 _QUIETBOX_PERF_SKU = "bh_quietbox"
 _PERF_MARGIN = 0.03
+# QuietBox SP4xTP1's sustained replays run at a power-limited clock that varies between runs.
+_PERF_MARGIN_BY_LAYOUT = {"SP4xTP1": 0.05}
 # Host wall time of one traced call: the median over _TIMING_SAMPLES samples, each of back-to-back trace replays
 # through device synchronization.
 _PERF_REFERENCE_MS = {
@@ -116,13 +118,17 @@ def _allocate_state(layer: ttKDA) -> KdaState:
     return layer.allocate_state(batch_size=1)
 
 
-def _assert_within_margin(what: str, measured_ms: float, reference_ms: float) -> None:
-    lower = reference_ms * (1.0 - _PERF_MARGIN)
-    upper = reference_ms * (1.0 + _PERF_MARGIN)
+def _perf_margin(layout: str) -> float:
+    return _PERF_MARGIN_BY_LAYOUT.get(layout, _PERF_MARGIN)
+
+
+def _assert_within_margin(what: str, measured_ms: float, reference_ms: float, margin: float) -> None:
+    lower = reference_ms * (1.0 - margin)
+    upper = reference_ms * (1.0 + margin)
     assert lower <= measured_ms <= upper, (
         f"{what} {measured_ms:.3f} ms is outside performance range "
         f"[{lower:.3f}, {upper:.3f}] ms "
-        f"(reference {reference_ms:.3f} ms ± {_PERF_MARGIN:.0%})"
+        f"(reference {reference_ms:.3f} ms ± {margin:.0%})"
     )
 
 
@@ -139,11 +145,13 @@ def _assert_within_margin(what: str, measured_ms: float, reference_ms: float) ->
 def test_synthetic_performance_uses_two_sided_margin(layout, sku, monkeypatch, expect_error) -> None:
     monkeypatch.setenv("KDA_PERF_SKU", sku)
     reference_ms = _perf_reference_ms(layout)
-    _assert_within_margin(layout, reference_ms, reference_ms)
+    margin = _perf_margin(layout)
+    _assert_within_margin(layout, reference_ms * (1 - 0.99 * margin), reference_ms, margin)
+    _assert_within_margin(layout, reference_ms * (1 + 0.99 * margin), reference_ms, margin)
     with expect_error(AssertionError, "outside performance range"):
-        _assert_within_margin(layout, reference_ms * 0.96, reference_ms)
+        _assert_within_margin(layout, reference_ms * (0.99 - margin), reference_ms, margin)
     with expect_error(AssertionError, "outside performance range"):
-        _assert_within_margin(layout, reference_ms * 1.04, reference_ms)
+        _assert_within_margin(layout, reference_ms * (1.01 + margin), reference_ms, margin)
 
 
 def _trace_wall_samples_ms(
@@ -307,7 +315,7 @@ def test_synthetic_kimi_k3_perf(
         "median_trace_wall_ms": median_wall_ms,
         "timing_sample_count": _TIMING_SAMPLES,
         "reference_trace_wall_ms": reference_ms,
-        "perf_margin_pct": _PERF_MARGIN * 100.0,
+        "perf_margin_pct": _perf_margin(layout) * 100.0,
     }
     print("KDA_SYNTHETIC_PERF=" + json.dumps(result, sort_keys=True))
     if report_only:
@@ -319,7 +327,7 @@ def test_synthetic_kimi_k3_perf(
             f"TP axis not wrapped: measured {median_wall_ms:.3f} ms on Linear TP; "
             "the Galaxy reference assumes the TP ring"
         )
-    _assert_within_margin(f"{layout} median trace wall", median_wall_ms, reference_ms)
+    _assert_within_margin(f"{layout} median trace wall", median_wall_ms, reference_ms, _perf_margin(layout))
 
 
 @pytest.mark.parametrize(
@@ -422,7 +430,7 @@ def test_kimi_k3_tp_reduce_scatter_perf(
         "trace_wall_samples_ms": samples_ms,
         "median_trace_wall_ms": median_wall_ms,
         "reference_trace_wall_ms": reference_ms,
-        "perf_margin_pct": _PERF_MARGIN * 100.0,
+        "perf_margin_pct": _perf_margin(layout) * 100.0,
     }
     print("KDA_TP_REDUCE_SCATTER_PERF=" + json.dumps(result, sort_keys=True))
-    _assert_within_margin(f"{layout} median trace wall", median_wall_ms, reference_ms)
+    _assert_within_margin(f"{layout} median trace wall", median_wall_ms, reference_ms, _perf_margin(layout))
