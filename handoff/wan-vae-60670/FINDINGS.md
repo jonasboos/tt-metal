@@ -229,6 +229,33 @@ Branch `jameslee/fix-60670-reassemble-threads` (off `main`, commit `b1eac850de6`
 The infra-side fix is to keep CI job cpusets off the Weka-dedicated cores (CPUs 1–2 and their SMT
 siblings 33–34), as Weka recommends for dedicated cores.
 
+### Validation of the scoped fix on CI (run 39501497353)
+
+- Attempt 1: host `bh-glx-120-d04u02` again, device 23 GDDR training failure on all 10 resets,
+  test never ran.
+- Attempt 2: host `bh-glx-120-d04u20`, torch at 64 threads. **720p VAE 0.641 s, PASS** (target
+  0.85; 1.02–1.05 s in every run since 09-15). Denoise 157 s and text encoding 0.08 s unchanged.
+  The 480p test timed out (see below).
+
+### Separate issue: cold-start weight conversion is slow today, independent of the fix
+
+Each fresh CI container converts both transformers from PyTorch weights in the first test (480p).
+
+| Run | Host | torch threads | `convert WanTransformer3DModel` ×2 | 480p test |
+|---|---|---|---|---|
+| nightly 10-16 | d06u08 | 64 | 415 / 406 s | completed |
+| nightly 10-17 | d07u08 | 64 | 375 / 389 s | completed |
+| nightly 10-18 | d07u08 | 64 | 413 / 387 s | completed |
+| nightly 10-20 05:10 | d04u08 | 64 | 671 / 508 s | completed |
+| global-cap fix, 10-20 20:48 | d04u14 | 32 | 994 / 724 s | timeout |
+| scoped fix, 10-20 23:47 | d04u20 | 64 | 802 / 686 s | timeout |
+
+Conversion time rose on 10-20 whatever the thread count (probably storage or host variance in
+reading the HF weights). Above roughly 650 s per transformer, the 480p test exceeds its 1800 s
+timeout. **Correction:** the earlier claim that 32 threads doubles conversion time was confounded
+by this. The global cap may cost less than it looked, but the scoped fix is still preferable
+because it cannot affect bulk host work.
+
 **Open question for infra:** when the Weka client (busy-polling CPUs 1–2) was deployed to the
 `multihost-ci-sc1-*` galaxy hosts. The regression starts between 2026-09-14 03:33 and
 2026-09-15 13:18 UTC, across the 09-15 morning outage.
