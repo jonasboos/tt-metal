@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import statistics
@@ -33,6 +34,7 @@ from models.demos.deepseek_v3_d_p.tt.kda.kda import KdaState, reduce_scatter_tp_
 from models.demos.deepseek_v3_d_p.tt.tt_ccl import per_axis_topology
 from models.tt_transformers.tt.ccl import TT_CCL
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import comp_pcc
+from tests.ttnn.profiling.realtime_profiler_utils import profile_realtime_program, require_realtime_profiler
 from tests.ttnn.unit_tests.operations.experimental.kda.kda_test_utils import make_actual_start
 
 pytestmark = [
@@ -48,7 +50,7 @@ _LOUDBOX_PERF_SKU = "bh_loudbox"
 _QUIETBOX_PERF_SKU = "bh_quietbox"
 _PERF_MARGIN = 0.03
 # QuietBox SP4xTP1's sustained replays run at a power-limited clock that varies between runs.
-_PERF_MARGIN_BY_LAYOUT = {"SP4xTP1": 0.07}
+_PERF_MARGIN_BY_LAYOUT = {"SP4xTP1": 0.08}
 # Host wall time of one traced call: the median over _TIMING_SAMPLES samples, each of back-to-back trace replays
 # through device synchronization.
 _PERF_REFERENCE_MS = {
@@ -57,8 +59,16 @@ _PERF_REFERENCE_MS = {
         "TP4-linear": 0.188,
     },
     _QUIETBOX_PERF_SKU: {
-        "SP4xTP1": 1.600,
+        "SP4xTP1": 1.585,
         "TP4-ring": 0.086,
+    },
+}
+# Device time of one traced call: the sum over its programs of the slowest chip's realtime-profiler duration, the
+# median over _TIMING_SAMPLES replays. It counts clock cycles, so the power-limited clock moves it less than wall time.
+_DEVICE_PERF_MARGIN = 0.03
+_DEVICE_PERF_REFERENCE_MS = {
+    _QUIETBOX_PERF_SKU: {
+        "SP4xTP1": 1.437,
     },
 }
 # Galaxy-equivalent layouts outside CI: they report wall time but are not gated.
@@ -114,6 +124,11 @@ def _perf_reference_ms(layout: str) -> float:
     return _PERF_REFERENCE_MS[sku][layout]
 
 
+def _device_perf_reference_ms(layout: str) -> float | None:
+    """Return the device-time reference for a layout on the KDA_PERF_SKU, or None if it has none."""
+    return _DEVICE_PERF_REFERENCE_MS.get(os.environ.get("KDA_PERF_SKU"), {}).get(layout)
+
+
 def _allocate_state(layer: ttKDA) -> KdaState:
     return layer.allocate_state(batch_size=1)
 
@@ -154,6 +169,14 @@ def test_synthetic_performance_uses_two_sided_margin(layout, sku, monkeypatch, e
         _assert_within_margin(layout, reference_ms * (1.01 + margin), reference_ms, margin)
 
 
+def test_synthetic_device_performance_uses_two_sided_margin(monkeypatch, expect_error) -> None:
+    monkeypatch.setenv("KDA_PERF_SKU", _QUIETBOX_PERF_SKU)
+    reference_ms = _device_perf_reference_ms("SP4xTP1")
+    _assert_within_margin("SP4xTP1", reference_ms * (1 + 0.99 * _DEVICE_PERF_MARGIN), reference_ms, _DEVICE_PERF_MARGIN)
+    with expect_error(AssertionError, "outside performance range"):
+        _assert_within_margin("SP4xTP1", reference_ms * (1.01 + _DEVICE_PERF_MARGIN), reference_ms, _DEVICE_PERF_MARGIN)
+
+
 def _trace_wall_samples_ms(
     mesh_device: ttnn.MeshDevice,
     layer: ttKDA,
@@ -162,7 +185,8 @@ def _trace_wall_samples_ms(
     validate_first_replay: Callable[[KdaState, ttnn.Tensor], dict[str, float]] | None = None,
     actual_start: int = 0,
     actual_end: int | None = None,
-) -> tuple[list[float], dict[str, float] | None]:
+    device_time: bool = False,
+) -> tuple[list[float], dict[str, float] | None, list[float] | None]:
     state = None
     warm_output = None
     warm_state = None
@@ -202,7 +226,22 @@ def _trace_wall_samples_ms(
                 ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
             ttnn.synchronize_device(mesh_device)
             samples_ms.append((time.perf_counter() - start) * 1e3 / repetitions)
-        return samples_ms, validation
+        device_samples_ms = None
+        if device_time:
+            device_samples_ms = []
+            for _ in range(_TIMING_SAMPLES):
+                _, records = profile_realtime_program(
+                    mesh_device,
+                    lambda: ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False),
+                    collect_all=True,
+                )
+                critical_path = collections.defaultdict(float)
+                for record in records:
+                    critical_path[record["runtime_id"]] = max(
+                        critical_path[record["runtime_id"]], record["duration_ns"]
+                    )
+                device_samples_ms.append(sum(critical_path.values()) / 1e6)
+        return samples_ms, validation, device_samples_ms
     finally:
         try:
             if trace_id is not None:
@@ -293,15 +332,20 @@ def test_synthetic_kimi_k3_perf(
         _GALAXY_ROWS_PER_CHIP,
         _GALAXY_HEADS_PER_CHIP,
     ), f"{layout} must run Galaxy's per-chip workload"
-    samples_ms, _ = _trace_wall_samples_ms(
+    device_reference_ms = None if report_only else _device_perf_reference_ms(layout)
+    if device_reference_ms is not None:
+        require_realtime_profiler(f"the {layout} device-time gate")
+    samples_ms, _, device_samples_ms = _trace_wall_samples_ms(
         mesh_device,
         layer,
         hidden_tt,
         _REPETITIONS,
         actual_start=actual_start,
         actual_end=actual_end,
+        device_time=ttnn.device.IsProgramRealtimeProfilerActive(),
     )
     median_wall_ms = statistics.median(samples_ms)
+    median_device_ms = None if device_samples_ms is None else statistics.median(device_samples_ms)
     result = {
         "fabric_config": ttnn.get_fabric_config().name,
         "layout": layout,
@@ -316,6 +360,10 @@ def test_synthetic_kimi_k3_perf(
         "timing_sample_count": _TIMING_SAMPLES,
         "reference_trace_wall_ms": reference_ms,
         "perf_margin_pct": _perf_margin(layout) * 100.0,
+        "device_samples_ms": device_samples_ms,
+        "median_device_ms": median_device_ms,
+        "reference_device_ms": device_reference_ms,
+        "device_perf_margin_pct": _DEVICE_PERF_MARGIN * 100.0,
     }
     print("KDA_SYNTHETIC_PERF=" + json.dumps(result, sort_keys=True))
     if report_only:
@@ -328,6 +376,8 @@ def test_synthetic_kimi_k3_perf(
             "the Galaxy reference assumes the TP ring"
         )
     _assert_within_margin(f"{layout} median trace wall", median_wall_ms, reference_ms, _perf_margin(layout))
+    if device_reference_ms is not None:
+        _assert_within_margin(f"{layout} median device", median_device_ms, device_reference_ms, _DEVICE_PERF_MARGIN)
 
 
 @pytest.mark.parametrize(
