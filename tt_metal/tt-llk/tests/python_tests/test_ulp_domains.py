@@ -17,7 +17,6 @@ from helpers.ulp_domains import (
     CEILINGS,
     DOMAIN_MIN_BIN_LANES,
     DOMAIN_MIN_LANES,
-    LIST_OUTPUTS,
     Domain,
     binade,
     binade_edges,
@@ -205,16 +204,6 @@ def test_spans_with_no_figure_draw_no_list():
     assert entries_of(((-INF, 0.0, True), (0.0, INF, False)), lambda lo, hi: None) == ()
 
 
-def test_the_list_outputs_are_the_registrys():
-    """The outputs with a per-element ULP, which this module cannot import."""
-    from helpers.format_config import DataFormat
-    from helpers.ulp import _ULP_PROXY_DTYPES, has_ulp_gate
-
-    assert LIST_OUTPUTS == {
-        f.name for f in DataFormat if has_ulp_gate(f) and f not in _ULP_PROXY_DTYPES
-    }
-
-
 _OK = [
     {"low": -INF, "high": -1, "ulp": 3},
     {"low": -1, "high": 1, "ulp": 10},
@@ -299,10 +288,13 @@ def test_the_one_spelling_reads_back_as_the_same_numbers():
 
 def test_the_ceilings_are_the_registrys():
     """The slim runner cannot import the registry, so the ceilings are spelled out here;
-    they must be ``usable_budget_ceiling``'s to the step."""
+    they must be ``usable_budget_ceiling``'s to the step, over exactly the formats the
+    SFPU computes in."""
     from helpers.format_config import DataFormat
     from helpers.sfpu_accuracy_budget import usable_budget_ceiling
+    from helpers.ulp import ULP_FORMATS
 
+    assert set(CEILINGS) == {f.name for f in ULP_FORMATS}
     assert CEILINGS == {
         name: usable_budget_ceiling(DataFormat[name]) for name in CEILINGS
     }

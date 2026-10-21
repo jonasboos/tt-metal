@@ -4,19 +4,17 @@
 """Host-side guards for ``helpers/ulp_provenance.py``: the budget table read as rows,
 and each row's provenance as fields of its own.
 
-No verdict depends on a row's comment: the provenance is ``measured``, ``nonfinite``
-and ``run`` / ``sampled``, which PyYAML loads and the registry loader validates; on a
-ULP row ``measured`` is the gate. Where a comment is asserted, it is to check that the
+No verdict depends on a row's comment: the provenance is ``measured`` and
+``nonfinite``, which PyYAML loads and the registry loader validates; on a ULP row
+``measured`` is the gate. Where a comment is asserted, it is to check that the
 prose is read back as written.
 """
 
 import math
 from dataclasses import fields
-from datetime import date, datetime
 
 import pytest
 from helpers.sfpu_accuracy_budget import _SFPU_ACCURACY_BUDGET, _TABLE_PATH
-from helpers.sfpu_domains import _UNARY_OPS_NOT_SWEPT, sfpu_unary_ops
 from helpers.ulp_domains import Domain
 from helpers.ulp_provenance import (
     PROVENANCE_FIELDS,
@@ -25,24 +23,18 @@ from helpers.ulp_provenance import (
     render_row,
 )
 
-_DAY = date(2026, 10, 5)
-
 
 @pytest.mark.parametrize(
     "provenance",
     [
-        Provenance(measured=5, run=_DAY),
-        Provenance(measured=0, sampled=_DAY),
-        Provenance(measured=393, nonfinite=6, run=_DAY),
-        Provenance(nonfinite=3, run=_DAY),
-        Provenance(run=_DAY),
+        Provenance(measured=5),
+        Provenance(measured=393, nonfinite=6),
+        Provenance(nonfinite=3),
         Provenance(),
     ],
     ids=lambda p: ", ".join(f"{k}={v}" for k, v in p.as_fields().items()) or "none",
 )
 def test_a_written_row_reads_back_as_the_provenance_it_was_written_with(provenance):
-    """``render_row`` writes a date unquoted, so PyYAML reads it back as a date and not
-    a string the loader would refuse."""
     fields = {"in": "Float16", "out": "Float16", **provenance.as_fields()}
     (row,) = BudgetTable("Gelu:\n" + render_row(fields, "prose")).rows
     assert row.provenance == provenance
@@ -53,28 +45,11 @@ def test_a_written_row_reads_back_as_the_provenance_it_was_written_with(provenan
 @pytest.mark.parametrize(
     "fields, problem",
     [
-        (dict(measured=1), "needs the `run` or `sampled` date"),
-        (dict(nonfinite=7), "`nonfinite` needs the `run` or `sampled` date"),
-        (dict(measured=1, run=_DAY, sampled=_DAY), "or sampled, not both"),
-        (dict(measured=True, run=_DAY), "integer >= 0"),
-        (dict(measured=-1, run=_DAY), "integer >= 0"),
-        (dict(nonfinite=0, run=_DAY), "integer >= 1"),
-        (dict(measured=1, run="2026-10-05"), "must be a date"),
-        # An unquoted `2026-10-05 12:00:00` loads as a datetime, which is a date too.
-        (dict(measured=1, run=datetime(2026, 10, 5, 12, 0)), "must be a date"),
-        (dict(sampled=_DAY), "without the `measured` figure"),
+        (dict(measured=True), "integer >= 0"),
+        (dict(measured=-1), "integer >= 0"),
+        (dict(nonfinite=0), "integer >= 1"),
     ],
-    ids=[
-        "no-date",
-        "nonfinite-no-date",
-        "run-and-sampled",
-        "bool",
-        "negative",
-        "nonfinite-zero",
-        "string-date",
-        "datetime",
-        "sampled-alone",
-    ],
+    ids=["bool", "negative", "nonfinite-zero"],
 )
 def test_a_malformed_provenance_says_what_is_wrong(fields, problem):
     """Each problem by name; the loader prefixes the row it came from."""
@@ -82,28 +57,19 @@ def test_a_malformed_provenance_says_what_is_wrong(fields, problem):
     assert len(problems) == 1 and problem in problems[0], problems
 
 
-def test_which_run_measured_a_row_and_whether_it_was_measurable():
-    assert Provenance(measured=1, run=_DAY).swept
-    assert not Provenance(measured=1, sampled=_DAY).swept
-    assert Provenance(measured=7, nonfinite=2, run=_DAY).unmeasurable
-    assert Provenance(run=_DAY).unmeasurable  # the sweep ran and ranked no lane
-    assert not Provenance(measured=7, run=_DAY).unmeasurable
-
-
-def test_an_alias_row_a_yaml_boolean_and_a_date_read_as_the_loader_reads_them():
+def test_an_alias_row_and_a_yaml_boolean_read_as_the_loader_reads_them():
     table = BudgetTable(
         "Anchor:\n"
         "  - &lut {metric: tolerance, atol: 0.13}  # the anchor\n"
         "Gelu:\n"
         "  - *lut  # through the alias\n"
-        "  - {in: Float16, out: Float16, dest: Yes, measured: 2, "
-        "run: 2026-10-05}\n"
+        "  - {in: Float16, out: Float16, dest: Yes, measured: 2}\n"
     )
     alias, keyed = table.rows_of("Gelu")
     assert alias.alias and alias.values["atol"] == 0.13
     assert alias.comment == "through the alias"
     assert keyed.pinned["dest"] == "Yes"
-    assert keyed.provenance == Provenance(measured=2, run=_DAY)
+    assert keyed.provenance == Provenance(measured=2)
 
 
 def test_an_op_whose_whole_row_list_is_an_alias_has_the_anchors_rows():
@@ -111,7 +77,7 @@ def test_an_op_whose_whole_row_list_is_an_alias_has_the_anchors_rows():
     registry enforces. Each is an alias row, located on the key line."""
     table = BudgetTable(
         "Abs: &low\n"
-        "  - {out: Float16_b, measured: 2, run: 2026-10-05}\n"
+        "  - {out: Float16_b, measured: 2}\n"
         "  - {out: Float32, metric: tolerance}\n"
         "Neg: *low\n"
     )
@@ -152,51 +118,6 @@ def test_the_walk_sees_every_row_the_registry_loads(live):
     assert set(live.blocks) == {op.name for op in _SFPU_ACCURACY_BUDGET}
 
 
-def _swept_ops():
-    """The unary ops the sweep collects: those keyed in the table, less the excused
-    (``test_the_sweep_collects_every_keyed_op_whether_gating_or_emitting``)."""
-    return {op.name for op in _SFPU_ACCURACY_BUDGET if op in sfpu_unary_ops()} - {
-        op.name for op in _UNARY_OPS_NOT_SWEPT
-    }
-
-
-def test_every_row_the_sweep_drives_names_its_run(live):
-    """A row of a swept op that pins ``in`` and ``out`` on this arch is one the
-    emitter wrote, so it names the day the sweep measured it. A row there without a
-    ``run`` is one nothing re-derives: a hand edit, or an emitter that stopped writing
-    it."""
-    swept = _swept_ops()
-    stray = [
-        row.describe()
-        for row in live.rows
-        if row.op in swept
-        and "in" in row.pinned
-        and "out" in row.pinned
-        and "arch" not in row.pinned
-        and row.provenance.run is None
-    ]
-    assert not stray, "\n".join(stray)
-
-
-def test_only_the_sweep_claims_a_run(live):
-    """``run`` is the sweep's, and the audit holds such a row to exactly the emitter's
-    budget. A row of an op the sweep never collects was sampled by a functional driver,
-    and ``run`` on it would read a sample as swept."""
-    swept = _swept_ops()
-    claimed = [
-        row.describe()
-        for row in live.rows
-        if row.op not in swept and row.provenance.run is not None
-    ]
-    assert not claimed, "\n".join(claimed)
-
-
-def test_no_key_line_carries_a_run_clause(live):
-    """A row names its own run; a `measured by:` clause on a key line would be a
-    second, unread statement of it that could only drift."""
-    assert not [op for op, b in live.blocks.items() if "measured by:" in b.header]
-
-
 def test_the_provenance_fields_are_the_loaders(tmp_path):
     """The fields are the :class:`Provenance` dataclass's, none of them a contract or key
     field, and the loader accepts each one on a row."""
@@ -207,9 +128,8 @@ def test_the_provenance_fields_are_the_loaders(tmp_path):
     path = tmp_path / "budget.yaml"
     path.write_text(
         "Abs:\n"
-        "  - {out: Float16_b, near_zero_atol: 1.0e-3, measured: 2, run: 2026-10-05}\n"
-        "  - {out: Float16, metric: tolerance, measured: 3, nonfinite: 2,"
-        " sampled: 2026-10-05}\n",
+        "  - {out: Float16_b, near_zero_atol: 1.0e-3, measured: 2}\n"
+        "  - {out: Float16, metric: tolerance, measured: 3, nonfinite: 2}\n",
         encoding="utf-8",
     )
     assert len(_load_table(path)[next(iter(_load_table(path)))]) == 2
@@ -221,11 +141,10 @@ def test_a_block_style_row_reads_its_own_fields_not_the_next_rows():
         "  - in: Float16\n"
         "    out: Float16\n"
         "    measured: 1\n"
-        "    run: 2026-01-01\n"
-        "  - {in: Float32, out: Float32, measured: 2, run: 2026-01-01}\n"
+        "  - {in: Float32, out: Float32, measured: 2}\n"
     )
     first, second = table.rows_of("Abs")
-    assert first.last_line == 4 and first.provenance.measured == 1
+    assert first.last_line == 3 and first.provenance.measured == 1
     assert second.provenance.measured == 2
 
 
@@ -263,11 +182,11 @@ def test_a_merge_key_may_override_what_it_merges():
 def test_a_borrowed_measurement_is_refused_with_its_line():
     """On a 4,000-row table the author needs to know which `<<` row it was."""
     with pytest.raises(  # allow-pytest.raises: host-only test
-        ValueError, match="line 4: `measured`, `run` reaches a row only through"
+        ValueError, match="line 4: `measured` reaches a row only through"
     ):
         BudgetTable(
             "Abs:\n"
-            "  - &b {out: Float16_b, measured: 2, run: 2026-10-05}\n"
+            "  - &b {out: Float16_b, measured: 2}\n"
             "Neg:\n"
             "  - {<<: *b, out: Float32}\n"
         )
@@ -276,9 +195,8 @@ def test_a_borrowed_measurement_is_refused_with_its_line():
 @pytest.mark.parametrize(
     "text",
     [
-        "<<: {Abs: [{out: Float16_b, measured: 2, run: 2026-10-05}]}\n",
-        "x: &x {measured: 2, run: 2026-10-05}\n"
-        "<<: {Abs: [{<<: *x, out: Float16, measured: 2}]}\n",
+        "<<: {Abs: [{out: Float16_b, measured: 2}]}\n",
+        "x: &x {measured: 2}\n" "<<: {Abs: [{<<: *x, out: Float16, measured: 2}]}\n",
     ],
     ids=["op-through-a-root-merge", "borrowed-inside-a-root-merge"],
 )
@@ -299,7 +217,7 @@ def test_an_op_the_walk_cannot_place_is_refused():
     with pytest.raises(  # allow-pytest.raises: host-only test
         ValueError, match=r"cannot locate op\(s\) \['True'\]"
     ):
-        BudgetTable("true:\n  - {out: Float16_b, measured: 2, run: 2026-10-05}\n")
+        BudgetTable("true:\n  - {out: Float16_b, measured: 2}\n")
 
 
 def test_a_list_row_is_rendered_in_the_one_spelling_and_read_back():
@@ -312,21 +230,18 @@ def test_a_list_row_is_rendered_in_the_one_spelling_and_read_back():
             "in": "Float16_b",
             "out": "Float16_b",
             "dest": "No",
-            "run": _DAY,
             "domains": entries,
         }
     )
     assert line == (
-        '  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-05, domains: '
+        '  - {in: Float16_b, out: Float16_b, dest: "No", domains: '
         "[{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, "
         "{low: 1, high: .inf, ulp: 3}]}\n"
     )
     (row,) = BudgetTable("Tanh:\n" + line).rows
     assert row.domains == entries
     assert (row.metric, row.max_ulp) == ("tolerance", None)  # 10 is past bf16's 6
-    assert row.provenance == Provenance(run=_DAY) and not row.unmeasurable
-    within = render_row(
-        {"in": "Float16_b", "out": "Float32", "run": _DAY, "domains": entries}
-    )
+    assert row.provenance == Provenance() and not row.unmeasurable
+    within = render_row({"in": "Float16_b", "out": "Float32", "domains": entries})
     (row,) = BudgetTable("Tanh:\n" + within).rows
     assert (row.metric, row.max_ulp) == ("ulp", 10)  # fp32's ceiling is 419,430

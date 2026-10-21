@@ -25,7 +25,7 @@ import argparse
 import itertools
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree
@@ -37,7 +37,6 @@ if __package__:
         CEILINGS,
         DOMAIN_MIN_BIN_LANES,
         DOMAINS_FIELD,
-        LIST_OUTPUTS,
         NOT_BESIDE_DOMAINS,
         Domain,
         binade_edges,
@@ -60,7 +59,6 @@ else:  # run by path on the slim runner, where `helpers/__init__.py` cannot impo
         CEILINGS,
         DOMAIN_MIN_BIN_LANES,
         DOMAINS_FIELD,
-        LIST_OUTPUTS,
         NOT_BESIDE_DOMAINS,
         Domain,
         binade_edges,
@@ -84,22 +82,18 @@ else:  # run by path on the slim runner, where `helpers/__init__.py` cannot impo
 #: out because this module may not import the registry; a host test ties them together.
 MEASURED_ARCH = "WORMHOLE"
 
-#: The output formats a step budget can bind on: ``ulp.has_ulp_gate`` is true for exactly
-#: these. A block float with no per-element ULP keeps its lattice compare, so a step row
-#: on one is inert in the registry. Spelled out for the same reason as MEASURED_ARCH; a
-#: host test ties it to ``has_ulp_gate``.
-ULP_GATED_OUTPUTS = frozenset({"Float16_b", "Float16", "Float32", "Bfp8_b"})
-
 #: The fields a row may carry beyond its key: ``sfpu_accuracy_budget._CONTRACT_FIELDS``.
 #: A ULP row's gate is its ``measured`` figure, a provenance field -- or its ``domains``
 #: list (``ulp_domains``), which stands in for every cell-level field.
 CONTRACT_FIELDS = frozenset({"metric", "atol", "rtol", "near_zero_atol"})
 
 #: The fields of the schema before the measurement became the gate, read on a diff's
-#: *base* side only: ``max_ulp``, the gate, beside the ``measured`` figure under it, and
-#: ``measured_all``, a floored row's worst lane over every lane. The head is held to the
-#: current schema, so the guard can audit the migration itself against its base.
-LEGACY_FIELDS = frozenset({"max_ulp", "measured_all"})
+#: *base* side only: ``max_ulp``, the gate, beside the ``measured`` figure under it,
+#: ``measured_all``, a floored row's worst lane over every lane, and the ``run`` or
+#: ``sampled`` date. A base row keyed on a block float is left out: no row may name one
+#: now. The head is held to the current schema, so the guard can audit the migration
+#: itself against its base.
+LEGACY_FIELDS = frozenset({"max_ulp", "measured_all", "run", "sampled"})
 
 #: The sweep's skip reasons for a cell it measured and recorded but does not gate. A
 #: skip that does not carry it (off Wormhole, ``--compile-producer``) wrote nothing.
@@ -127,8 +121,7 @@ class Row:
     op: str
     key: Tuple[Tuple[str, str], ...]
     max_ulp: Optional[int]
-    #: The measurement the row records, from its own fields. A raise that comes with a
-    #: new one is a re-measurement; one that leaves it as it was is a number edited.
+    #: The measurement the row records, from its own fields.
     provenance: Provenance
     #: The row's ``domains`` list, or ``()``: then the gate is entry by entry, and
     #: ``max_ulp`` is the whole-cell figure the list implies (``ulp_domains``).
@@ -140,9 +133,6 @@ class Row:
     #: tolerance cell with them, so widening one loosens that cell.
     atol: Optional[float] = None
     rtol: Optional[float] = None
-    #: An alias row (``- *anchor``, or ``Neg: *low``): its provenance is its anchor's,
-    #: so a retargeted alias carries a measurement the base already had.
-    alias: bool = field(default=False, compare=False)
 
     @property
     def gated(self) -> bool:
@@ -178,16 +168,6 @@ class Change:
     nothing covers any more); *variants* is how many query variants that row decides
     differently than the base did, since a collapsed row governs several. *held_before*
     and *held_after* say what the cell was held to on each side, as the report shows it.
-
-    *remeasured* is whether the deciding row's provenance (its measurement fields)
-    differs from the same row's in the base table -- the table's rule for raising a
-    budget. Read off that one row, not off the two rows the cell resolves to: when a
-    deleted row hands its cells to a broader one, those two rows' fields differ although
-    neither was re-measured. An alias row's fields are its anchor's, so it counts only
-    with provenance no base row had. ``None`` -- reported "n/a" -- for a widened
-    ``atol``/``rtol`` bound when no row involved records a measurement: not the deciding
-    row in either revision, nor the row the cell resolved to in the base. ``measured``
-    is a step count, which such a row cannot record, so the rule cannot apply to it.
     """
 
     cell: Cell
@@ -197,7 +177,6 @@ class Change:
     variants: int = 1
     held_before: str = "—"
     held_after: str = "—"
-    remeasured: Optional[bool] = False
     #: The input range the change is about, ``[low, high)``, when either side's row
     #: carries a ``domains`` list and the cell is judged segment by segment; empty for
     #: a whole-cell change.
@@ -258,8 +237,8 @@ def _check_number(where: str, name: str, value, *, integer: bool = False) -> Non
 def _check_list_row(where: str, fields: dict) -> None:
     """What the registry refuses on a row with a ``domains`` list
     (``sfpu_accuracy_budget._list_contract``): a cell-level field beside it, a row that
-    does not pin the formats it was measured on or name its run, an output with no
-    per-element ULP, or a list ``ulp_domains.check_domains`` refuses."""
+    does not pin the formats it was measured on, or a list ``ulp_domains.check_domains``
+    refuses."""
     for field in NOT_BESIDE_DOMAINS:
         if field in fields:
             raise ValueError(
@@ -269,15 +248,6 @@ def _check_list_row(where: str, fields: dict) -> None:
     if fields.get("in") is None or fields.get("out") is None:
         raise ValueError(
             f"{where}: a `{DOMAINS_FIELD}` list needs the row to pin `in` and `out`"
-        )
-    if "run" not in fields:
-        raise ValueError(
-            f"{where}: a `{DOMAINS_FIELD}` list names the `run` that measured it"
-        )
-    check_provenance(where, fields, tolerance=True)
-    if key_value(fields["out"]) not in LIST_OUTPUTS:
-        raise ValueError(
-            f"{where}: {fields['out']} has no per-element ULP, so no `{DOMAINS_FIELD}`"
         )
     check_domains(where, fields[DOMAINS_FIELD])
     if fields.get("near_zero_atol") is not None:
@@ -290,13 +260,23 @@ def _check_list_row(where: str, fields: dict) -> None:
             raise ValueError(f"{where}: {flag} must be Yes or No, got {fields[flag]!r}")
 
 
+def _names_a_block_float(fields: dict) -> bool:
+    """Whether a row keys ``in`` or ``out`` on a format the SFPU does not compute in
+    (:data:`CEILINGS`): the registry refuses it."""
+    return any(
+        fields.get(axis) is not None and key_value(fields[axis]) not in CEILINGS
+        for axis in ("in", "out")
+    )
+
+
 def _check_row(where: str, fields: dict, *, legacy: bool = False) -> None:
     """What the registry refuses in one row, so a table it cannot load gets no verdict:
     an unknown field, a metric that is neither, provenance fields wrong on their own or
     for the row's contract (:func:`check_provenance`, the registry's own check), a bad
     number, the two metrics' fields mixed in one row, or a ``domains`` list the
     registry would not take (:func:`_check_list_row`). *legacy* also admits
-    :data:`LEGACY_FIELDS`, as the registry of that schema did."""
+    :data:`LEGACY_FIELDS`, as the registry of that schema did, and its caller skips a
+    row that names a block float."""
     unknown = (
         set(fields)
         - set(KEY_FIELDS)
@@ -307,6 +287,11 @@ def _check_row(where: str, fields: dict, *, legacy: bool = False) -> None:
     )
     if unknown:
         raise ValueError(f"{where}: unknown field(s) {sorted(unknown)}")
+    if _names_a_block_float(fields):
+        raise ValueError(
+            f"{where}: a row names only {', '.join(CEILINGS)}, the formats the SFPU "
+            "computes in"
+        )
     if DOMAINS_FIELD in fields:
         _check_list_row(where, fields)
         return
@@ -314,10 +299,6 @@ def _check_row(where: str, fields: dict, *, legacy: bool = False) -> None:
     if metric not in ("ulp", "tolerance"):
         raise ValueError(f"{where}: metric must be ulp or tolerance, got {metric!r}")
     check_provenance(where, fields, tolerance=metric == "tolerance")
-    for name in LEGACY_FIELDS & set(fields):
-        _check_number(where, name, fields[name], integer=True)
-        if metric == "tolerance":
-            raise ValueError(f"{where}: {name} belongs to the ulp metric")
     for name in ("atol", "rtol", "near_zero_atol"):
         if fields.get(name) is not None:
             _check_number(where, name, fields[name])
@@ -354,9 +335,12 @@ def parse_table(text: str, *, legacy: bool = False) -> Dict[Cell, Row]:
         for index, fields in enumerate(entries if isinstance(entries, list) else []):
             if not isinstance(fields, dict):
                 raise ValueError(f"{op}: row {index + 1} is not a mapping")
-            _check_row(f"{op} row {index + 1}", fields, legacy=legacy)
+            if not (legacy and _names_a_block_float(fields)):
+                _check_row(f"{op} row {index + 1}", fields, legacy=legacy)
     rows: Dict[Cell, Row] = {}
     for row in table.rows:
+        if legacy and _names_a_block_float(row.values):
+            continue
         cell: Cell = (row.op, row.key)
         if cell in rows:
             # `_load_table` refuses two rows of equal specificity, so this table
@@ -375,7 +359,6 @@ def parse_table(text: str, *, legacy: bool = False) -> Dict[Cell, Row]:
             atol=_number(values.get("atol")),
             rtol=_number(values.get("rtol")),
             domains=row.domains,
-            alias=row.alias,
         )
     return rows
 
@@ -427,13 +410,13 @@ def _resolve(
 
 def _gates(row: Optional[Row], key: Tuple[Tuple[str, str], ...]) -> bool:
     """Whether *row* holds the cell *key* names to a step budget: it carries one, the
-    output has a per-element ULP (:data:`ULP_GATED_OUTPUTS`), and the cell is on the
+    output is one the SFPU computes in (:data:`CEILINGS`), and the cell is on the
     arch the budget was measured on -- :data:`MEASURED_ARCH` for a row that names none
     (an unset arch is that one), or the arch the row names."""
     if row is None or not row.gated:
         return False
     asked = dict(key)
-    if asked.get("out") is not None and asked["out"] not in ULP_GATED_OUTPUTS:
+    if asked.get("out") is not None and asked["out"] not in CEILINGS:
         return False
     return asked.get("arch", MEASURED_ARCH) == MEASURED_ARCH or "arch" in dict(row.key)
 
@@ -789,7 +772,6 @@ def compare(base: Dict[Cell, Row], head: Dict[Cell, Row]) -> List[Change]:
                         variants=found.variants + 1 if found else 1,
                         held_before=before_text,
                         held_after=after_text,
-                        remeasured=_remeasured(base, now.row, kind, was.row),
                         segment=segment,
                     )
                 continue
@@ -808,54 +790,10 @@ def compare(base: Dict[Cell, Row], head: Dict[Cell, Row]) -> List[Change]:
                 variants=found.variants + 1 if found else 1,
                 held_before=was.describe(),
                 held_after=now.describe(),
-                remeasured=_remeasured(base, now.row, kind, was.row),
             )
     return sorted(
         grouped.values(), key=lambda c: (_KIND_ORDER.index(c.kind), c.cell, c.segment)
     )
-
-
-def _remeasured(
-    base: Dict[Cell, Row],
-    row: Optional[Row],
-    kind: str = "",
-    resolved_before: Optional[Row] = None,
-) -> Optional[bool]:
-    """Whether *row*, the head row deciding a cell, was measured again: its ``run`` or
-    ``sampled`` date differs from the same row's in the base table. The figure is the
-    gate, so a figure that moved under an unchanged date is a number edited, not a
-    measurement; a new row counts with a date of its own, and an alias row only with a
-    date new to the whole base. ``None`` for a widened bound when neither *row* on
-    either side nor *resolved_before*, the row the cell resolved to in the base, records
-    a measurement (see :class:`Change`); any other loosening is held to the rule, an
-    ungating one too."""
-    if row is None:
-        return False
-    was = base.get((row.op, row.key))
-    unrecorded = all(
-        r is None or r.provenance == Provenance() for r in (row, was, resolved_before)
-    )
-    if kind == "tolerance_widened" and row.declares_tolerance and unrecorded:
-        return None
-    # Dropping a measurement is not taking one: the head row needs a date of its own.
-    if row.provenance.when is None:
-        return False
-    if row.alias:
-        # `Neg: *low` -> `*high` hands Neg the measurement `&high` already carried.
-        return row.provenance.when not in _dates(base)
-    return was is None or was.provenance.when != row.provenance.when
-
-
-#: Every date a table records, built once per table, for :func:`_remeasured`.
-_DATES: Dict[int, Tuple[Dict[Cell, Row], frozenset]] = {}
-
-
-def _dates(table: Dict[Cell, Row]) -> frozenset:
-    cached = _DATES.get(id(table))
-    if cached is None or cached[0] is not table:
-        found = frozenset(r.provenance.when for r in table.values())
-        cached = _DATES[id(table)] = (table, found)
-    return cached[1]
 
 
 _KIND_TEXT = {
@@ -896,13 +834,11 @@ def _md_table(
     ]
 
 
-def _change_row(c: Change, *, with_provenance: bool) -> str:
-    cells = f"| `{_describe(c)}` | {_KIND_TEXT[c.kind]} | {c.held_before} | "
-    cells += f"{c.held_after} |"
-    if with_provenance:
-        text = {True: "yes", False: "**no**", None: "n/a"}[c.remeasured]
-        cells += f" {text} |"
-    return cells
+def _change_row(c: Change) -> str:
+    return (
+        f"| `{_describe(c)}` | {_KIND_TEXT[c.kind]} | {c.held_before} | "
+        f"{c.held_after} |"
+    )
 
 
 def render_budget_diff(changes: List[Change]) -> str:
@@ -915,13 +851,13 @@ def render_budget_diff(changes: List[Change]) -> str:
     if regressions:
         out += [
             f"**{len(regressions)} cell(s) loosen a gate.** A gate is the row's "
-            "`measured` figure, so raising it is recording a worse measurement, with "
-            "its date, in a change of its own — that is the table's own rule, and it "
-            "is what makes every number in it traceable.",
+            "`measured` figure, so raising it is recording a worse measurement, in a "
+            "change of its own — that is the table's own rule, and it is what makes "
+            "every number in it traceable.",
             "",
             *_md_table(
-                ("cell", "change", "before", "after", "re-measured"),
-                [_change_row(c, with_provenance=True) for c in regressions],
+                ("cell", "change", "before", "after"),
+                [_change_row(c) for c in regressions],
             ),
             "",
             "If these are genuine re-measurements, say so in the PR body for the "
@@ -935,7 +871,7 @@ def render_budget_diff(changes: List[Change]) -> str:
             "",
             *_md_table(
                 ("cell", "change", "before", "after"),
-                [_change_row(c, with_provenance=False) for c in improvements],
+                [_change_row(c) for c in improvements],
                 capped=True,
             ),
             "",
@@ -946,22 +882,11 @@ def render_budget_diff(changes: List[Change]) -> str:
 
 
 def _allowed_note(regressions: List[Change]) -> str:
-    """Appended under --allow-raises: the loosened gates are
-    reported, not blocked, and the ones without a fresh measurement are named."""
-    note = (
+    """Appended under --allow-raises: the loosened gates are reported, not blocked."""
+    return (
         f"\n_Advisory: {len(regressions)} loosened gate(s) reported, not blocked; "
         "approving them is the table's code owners' review._\n"
     )
-    # A bound that cannot record a measurement ("n/a") was not edited instead of one.
-    unmeasured = [c for c in regressions if c.remeasured is False]
-    if unmeasured:
-        note += (
-            f"\n**{len(unmeasured)} of them carry no fresh measurement** -- the row's "
-            "measurement is unchanged, so the budget was edited rather than "
-            "re-measured:\n\n"
-        )
-        note += "".join(f"- `{(c.after or c.before).describe()}`\n" for c in unmeasured)
-    return note
 
 
 # ─────────────────────────────────────────────────────────────────────────────

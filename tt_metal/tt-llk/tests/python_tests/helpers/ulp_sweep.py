@@ -11,15 +11,14 @@ Exhaustive is only honest for the 16-bit formats. bfloat16 has 65,025 normal val
 (zero included) and float16 61,441, so either fits one 64-tile device run; Float32's 2**32
 does not, so it is walked with a stride that gives every binade an equal share. The
 subnormals are not fed at all: the unpack path flushes them, and a golden that does not
-would be measuring the flush rather than the op. ``Bfp8_b`` and ``Bfp4_b`` are swept in
-bfloat16 and packed on the way in -- neither has an enumerable value set of its own.
+would be measuring the flush rather than the op. Only the formats the SFPU computes in
+are swept: a block float's error is the unpacker's and packer's, not the op's.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, replace
-from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -37,31 +36,14 @@ from helpers.ulp_provenance import (
     render_row,
 )
 
-#: The formats this harness can judge a result in -- enumerated whole as inputs, except
-#: Float32, which is strided (`is_exhaustive`). Bfp8_b rides on the bfloat16 value set: the
-#: sweep generates bf16 and the pipeline packs it, which is the only sense in which a
-#: block format has "every value".
+#: The formats the sweep feeds and judges, in and out: the ones the SFPU computes in.
+#: Each is enumerated whole as an input, except Float32, which is strided
+#: (`is_exhaustive`).
 SWEEP_FORMATS: Tuple[DataFormat, ...] = (
     DataFormat.Float16_b,
     DataFormat.Float16,
-    DataFormat.Bfp8_b,
     DataFormat.Float32,
 )
-
-#: Fed as an *input* but never judged as an output: Bfp4_b keeps 2 fractional bits, so
-#: a bf16 step count would read each legal quantization of its output as 32 steps.
-SWEEP_INPUT_ONLY_FORMATS: Tuple[DataFormat, ...] = (DataFormat.Bfp4_b,)
-
-#: Every format the sweep feeds, whether or not it can judge a result in it.
-SWEEP_INPUT_FORMATS: Tuple[DataFormat, ...] = SWEEP_FORMATS + SWEEP_INPUT_ONLY_FORMATS
-
-#: What a block float's sweep is actually enumerated in: they have no enumerable value
-#: set of their own, so the sweep generates bfloat16 and the pipeline packs it on the
-#: way in.
-_STIMULI_FORMAT: Dict[DataFormat, DataFormat] = {
-    DataFormat.Bfp8_b: DataFormat.Float16_b,
-    DataFormat.Bfp4_b: DataFormat.Float16_b,
-}
 
 #: Float32 has 2**32 values and one run holds 2**16, so it is the one input the sweep
 #: samples rather than enumerates. Striding the total order gives every binade an equal
@@ -98,11 +80,10 @@ def sweep_cells(arch=None) -> List[Tuple[DataFormat, DataFormat, object, object]
 
     The grid is Wormhole's. On another arch only the Dest promotion is applied, not that
     arch's own format support: Blackhole skips a ``Float16`` input with ``dest_acc=No``
-    (``_skip_if_unsupported`` in accuracy/test_sfpu_accuracy.py), and Quasar has no
-    ``Bfp8_b``. That is inert while every cell off
-    Wormhole resolves to tolerance and skips, which holds because no ULP row names
-    another ``arch``; test_ulp_sweep.py pins that, so the first such row has to bring
-    those filters with it.
+    (``_skip_if_unsupported`` in accuracy/test_sfpu_accuracy.py). That is inert while
+    every cell off Wormhole resolves to tolerance and skips, which holds because no ULP
+    row names another ``arch``; test_ulp_sweep.py pins that, so the first such row has
+    to bring those filters with it.
     """
     from helpers.chip_architecture import get_chip_architecture
     from helpers.data_format_inference import effective_dest_acc
@@ -112,7 +93,7 @@ def sweep_cells(arch=None) -> List[Tuple[DataFormat, DataFormat, object, object]
         arch = get_chip_architecture()
     return [
         (in_fmt, out_fmt, approx, dest)
-        for in_fmt in SWEEP_INPUT_FORMATS
+        for in_fmt in SWEEP_FORMATS
         for out_fmt in SWEEP_FORMATS
         for approx in ApproximationMode
         for dest in DestAccumulation
@@ -120,14 +101,9 @@ def sweep_cells(arch=None) -> List[Tuple[DataFormat, DataFormat, object, object]
     ]
 
 
-def stimuli_format_for(fmt: DataFormat) -> DataFormat:
-    """The format whose values the sweep enumerates in order to drive *fmt*."""
-    return _STIMULI_FORMAT.get(fmt, fmt)
-
-
 def is_exhaustive(input_format: DataFormat) -> bool:
     """Whether the sweep sees *every* value the input can take, or a stride of them."""
-    return stimuli_format_for(input_format) != DataFormat.Float32
+    return input_format != DataFormat.Float32
 
 
 def _stride_for(input_format: DataFormat) -> int:
@@ -146,11 +122,10 @@ def swept_value_count(input_format: DataFormat) -> int:
         _enumerate_representable,
     )
 
-    fmt = stimuli_format_for(input_format)
     stride = _stride_for(input_format)
     return int(
         _enumerate_representable(
-            fmt, -_INF, _INF, _SWEEP_TENSOR, stride=stride, normal_only=True
+            input_format, -_INF, _INF, _SWEEP_TENSOR, stride=stride, normal_only=True
         ).numel()
     )
 
@@ -201,41 +176,27 @@ def padding_lanes(src: torch.Tensor, input_format: DataFormat) -> torch.Tensor:
 def received_inputs(
     src: torch.Tensor, input_format: DataFormat, output_format=None, dest_acc=None
 ) -> torch.Tensor:
-    """*src* as the op receives it: what ``quantize_input_to_unpack_format`` hands the
-    golden, and the unpack hands the kernel. The same tensor on every format but a block
-    float -- and, given the variant, a Float32 input at ``dest_acc=No``, which the unpack
-    and the golden both truncate to the 16-bit Dest: past 256 every truncated bf16 value
-    is an integer, so -8326436.5 arrives as the pole -8323072.
-
-    The lane checks that ask where an input *is* -- on a singularity, inside the op's
-    claim, inside a tracked issue's lanes -- have to ask it of this value, not of the one
-    generated. On Bfp8_b the shared exponent moves a value across those boundaries: in
-    the sorted sweep 1.0 is the last lane of the block ``0x3F71..0x3F80``, so 0.992 and
-    0.996 both arrive as exactly 1.0, and ``atanh`` of them is the pole.
+    """*src* as the op receives it: the tensor itself, except, given the variant, a
+    Float32 input at ``dest_acc=No``, which the unpack and the golden both truncate to
+    the 16-bit Dest: past 256 every truncated bf16 value is an integer, so -8326436.5
+    arrives as the pole -8323072. The lane checks that ask where an input *is* -- on a
+    singularity, inside the op's claim, inside a tracked issue's lanes -- have to ask it
+    of this value, not of the one generated.
     """
-    from helpers.bfp_format_utils import BFP_BLOCK
-    from helpers.golden_generators import quantize_input_to_unpack_format
     from helpers.sfpu_domains import _dest_acc_flag
 
-    # The block quantizer works on whole BFP_BLOCK-lane blocks. A device sweep is a
-    # multiple of that; a host test may hand in a fragment, so pad it with zeros, which
-    # never raise a block's exponent, and drop the padding again.
-    flat = src.detach().flatten()
-    short = (-flat.numel()) % BFP_BLOCK
-    padded = torch.cat([flat, torch.zeros(short, dtype=flat.dtype, device=flat.device)])
-    received = quantize_input_to_unpack_format(padded, input_format)[: flat.numel()]
     if (
-        input_format == DataFormat.Float32
-        and dest_acc is not None
-        and not _dest_acc_flag(dest_acc)
+        input_format != DataFormat.Float32
+        or dest_acc is None
+        or _dest_acc_flag(dest_acc)
     ):
-        from helpers.golden_generators import truncate_to_dest_width
+        return src
+    from helpers.golden_generators import truncate_to_dest_width
 
-        width = _unpack_format(
-            input_format, output_format or DataFormat.Float16_b, dest_acc
-        )
-        received = truncate_to_dest_width(received.to(torch.float32), width)
-    return received.reshape(src.shape)
+    width = _unpack_format(
+        input_format, output_format or DataFormat.Float16_b, dest_acc
+    )
+    return truncate_to_dest_width(src.detach().to(torch.float32), width)
 
 
 def golden_input(src: torch.Tensor, input_format: DataFormat, dest_acc) -> torch.Tensor:
@@ -250,37 +211,28 @@ def golden_input(src: torch.Tensor, input_format: DataFormat, dest_acc) -> torch
     pole's ``-inf`` against ``+inf``, ``rsqrt(-0)``, was never a failure here: the
     singularity exclusion drops it.) The dedicated signed-zero tests in
     test_eltwise_unary_sfpu.py hold that path to account.
-
-    Not for a block-float input: the golden quantizes that itself, and in the
-    shared-exponent-0 block the zero lane sits in, the forced hidden bit turns it into
-    -2**-127 as -0.0 and +2**-127 (~6e-39) as +0.0 -- neither of them zero, so
-    canonicalizing moved Ceil/Sqrt/Log/Rsqrt's Bfp8_b cells rather than fixing them.
     """
     from helpers.sfpu_domains import negative_zero_delivered
 
-    if stimuli_format_for(input_format) != input_format or negative_zero_delivered(
-        input_format, dest_acc
-    ):
+    if negative_zero_delivered(input_format, dest_acc):
         return src
     return torch.where(src == 0, torch.zeros_like(src), src)
 
 
 def _unpack_format(input_format: DataFormat, output_format=None, dest_acc=None):
-    """The format whose values the unpacker writes for this cell, as the stimuli format
-    that carries them: a Float32 input into a Float16 output at ``dest_acc=No`` lands
-    in a Float16 Dest. Without *output_format* and *dest_acc*, the input's own."""
+    """The format whose values the unpacker writes for this cell: a Float32 input into
+    a Float16 output at ``dest_acc=No`` lands in a Float16 Dest. Without
+    *output_format* and *dest_acc*, the input's own."""
     if output_format is None or dest_acc is None:
-        return stimuli_format_for(input_format)
+        return input_format
     from helpers.data_format_inference import infer_unpack_out
     from helpers.sfpu_domains import unpacks_to_dest
 
-    return stimuli_format_for(
-        infer_unpack_out(
-            input_format,
-            output_format,
-            dest_acc,
-            unpacking_to_dest=unpacks_to_dest(input_format, dest_acc),
-        )
+    return infer_unpack_out(
+        input_format,
+        output_format,
+        dest_acc,
+        unpacking_to_dest=unpacks_to_dest(input_format, dest_acc),
     )
 
 
@@ -320,7 +272,7 @@ def dest_holds(
     if dtype is not torch.float16:
         return holds
     dest = torch.finfo(dtype)
-    out = torch.finfo(format_dict[stimuli_format_for(output_format)])
+    out = torch.finfo(format_dict[output_format])
     if dest.max >= out.max and dest.tiny <= out.tiny:
         return holds
     g = golden.detach().to(torch.float32)
@@ -347,24 +299,16 @@ def _normal_input(
     """Lanes whose input survives the unpack: zero, or at least the smallest normal of
     the stimuli format *and* of the format the unpacker writes, and no larger than that
     format can hold. The sweep feeds no subnormal of the stimuli format
-    (:func:`sweep_spec`), so that cutoff only ever bites on a value the block-float
-    quantizer makes subnormal (below). The unpack format matters once:
+    (:func:`sweep_spec`), so only the unpack format's cutoff bites, and it matters once:
     a Float32 input into a Float16 output at ``dest_acc=No`` unpacks into a Float16
     Dest, which flushes everything below 2**-14 -- a Float32 input's own cutoff is
     1.18e-38, so the strided lanes in between scored ``f(x)`` against ``f(0)`` as op
     error (Floor's Float32 -> Float16 cell read 15360 steps, the distance to 1.0).
     Without *output_format* and *dest_acc*, only the stimuli format's cutoff applies.
-
-    Judged on the input as generated *and* as received (:func:`received_inputs`). They
-    differ on a block float: the sweep's one ``-0.0`` shares a Bfp8_b block with the
-    bf16 subnormals ``0x8001..0x800F``, the shared exponent is 0, and the quantizer's
-    forced hidden bit gives the golden ``-2**-127``; ``floor`` of that is -1 against
-    the 0 silicon sees. That one lane was 16,129 steps on every
-    Bfp8_b-input cell of Floor and Signbit, and why Ceil and Trunc read 0 there.
     """
     from helpers.llk_params import format_dict
 
-    fed = torch.finfo(format_dict[stimuli_format_for(input_format)])
+    fed = torch.finfo(format_dict[input_format])
     cutoff = fed.smallest_normal
     ceiling = math.inf
     dtype = format_dict.get(_unpack_format(input_format, output_format, dest_acc))
@@ -384,10 +328,7 @@ def _normal_input(
     # 6.10e-05 and clears a 6.10e-05 threshold. The whole subnormal band then passed
     # this filter while looking, in any printout, like the smallest normal.
     magnitude = src.detach().to(torch.float32).abs()
-    survives = ((magnitude >= cutoff) | (magnitude == 0)) & (magnitude <= ceiling)
-    quantized_magnitude = received_inputs(src, input_format).to(torch.float32).abs()
-    quantized_subnormal = (quantized_magnitude < cutoff) & (quantized_magnitude != 0)
-    return survives & ~quantized_subnormal
+    return ((magnitude >= cutoff) | (magnitude == 0)) & (magnitude <= ceiling)
 
 
 def measurable_mask(
@@ -414,15 +355,12 @@ def measurable_mask(
       budget says, so ranking them would inflate the number without tightening the gate.
       One such lane is worth ~48,000 steps.
     * the sweep's own zero padding -- see :func:`padding_lanes`.
-    * inputs the unpack flushes, as the block-float quantizer hands them to the golden
-      (:func:`_normal_input`). The sweep feeds no subnormal of its own -- the hardware
-      flushes them on the way in and the golden does not, so ``ceil(5.69e-39)`` was 1
-      in the model and 0 on silicon, 16,129 bf16 steps for a difference that is the
-      unpack path's flush, not the op's accuracy, and the whole of Ceil's, Floor's and
-      Sqrt's apparent error -- but a ``Bfp8_b`` block's shared exponent can still make
-      a swept normal subnormal on the way in. The flush is covered on its own terms
-      elsewhere; a step count is the wrong instrument for it. The same boundary has a
-      top on a narrower unpack: a Float32
+    * inputs the unpack flushes (:func:`_normal_input`). The sweep feeds no subnormal of
+      its own -- the hardware flushes them on the way in and the golden does not, so
+      ``ceil(5.69e-39)`` was 1 in the model and 0 on silicon, 16,129 bf16 steps for a
+      difference that is the unpack path's flush, not the op's accuracy. The flush is
+      covered on its own terms elsewhere; a step count is the wrong instrument for it.
+      The same boundary has a top on a narrower unpack: a Float32
       input into a Float16 output at ``dest_acc=No`` lands in a Float16 Dest, which
       flushes below 2**-14 and *saturates* past 65504 -- about 44% of the strided lanes,
       whose golden sees the value as fed. Saturation, not a flush, and not the op's.
@@ -843,8 +781,7 @@ def nonfinite_failures(
 
     * **flushed inputs** (:func:`_normal_input`), on the same grounds as in the mask --
       the unpack path flushes a subnormal and the golden does not, so a disagreement
-      there is the flush. As generated or as the block-float quantizer hands it to the
-      golden: the sweep's ``-0.0`` becomes ``-2**-127`` in a Bfp8_b block of subnormals.
+      there is the flush.
     * **a NaN golden**, and **a golden past the output format's range answered by a
       saturated store** -- ``NaN``, an infinity of the golden's sign, or on a Float16
       output the pack's clamp to +-65504 of that sign. A full-range
@@ -885,7 +822,7 @@ def nonfinite_failures(
     from .ulp import nonfinite_mismatches
 
     normal_input = _normal_input(src, input_format, output_format, dest_acc)
-    output_max = torch.finfo(format_dict[stimuli_format_for(output_format)]).max
+    output_max = torch.finfo(format_dict[output_format]).max
     # `golden` is usually already in the output dtype, so "past the range" is mostly an
     # infinity; a wider golden can also be finite and past it. NaN compares false here.
     past_range = golden.detach().to(torch.float32).abs() > output_max
@@ -926,8 +863,10 @@ def nonfinite_failures(
 
 
 #: How many offending lanes a non-finite verdict spells out. Two: the verdict is written
-#: on each of the table's ~400 not-measurable rows, and at four the named lanes were a
-#: tenth of the file. The count beside them says how many there are; two show the kind.
+#: on each of the table's not-measurable rows, and at four the named lanes were a tenth
+#: of the file and took it past the repo's 500 KB `check-large-files` limit
+#: (test_the_table_fits_the_repos_file_size_limit). The count beside them says how many
+#: there are; two show the kind.
 NAMED_LANES = 2
 
 
@@ -1042,10 +981,8 @@ def near_zero_floor(
     The floor is exactly the largest absolute error it rescues, no margin and no
     rounding: like the step figure, it is the measurement."""
     from helpers.sfpu_accuracy_budget import usable_budget_ceiling
-    from helpers.ulp import _ULP_PROXY_DTYPES, NEAR_ZERO_FRACTION
+    from helpers.ulp import NEAR_ZERO_FRACTION
 
-    if out_fmt in _ULP_PROXY_DTYPES:
-        return None  # a block-float output is judged as a block; no floor applies
     ceiling = usable_budget_ceiling(out_fmt)
     flat = distance.reshape(-1).to(torch.int64)
     selected = mask.reshape(-1) & (flat >= 0)
@@ -1357,41 +1294,25 @@ def finish_emit(arch, testsfailed: int, path=None, exitstatus=0) -> WriteReport:
     gaps = _incomplete_grids()
     if gaps:
         raise IncompleteGrid(gaps)
-    # The day the rows name: the sweep is the run, on the arch the check above pinned.
-    return write_table(path or _TABLE_PATH, date.today())
+    return write_table(path or _TABLE_PATH)
 
 
 def _verdict(measured: int, out_fmt: str) -> Tuple[str, int]:
     """What the table should say for a measured worst lane on *out_fmt*.
 
     ``("ulp", measured)`` while the measurement fits the table's
-    ``usable_budget_ceiling`` -- 419,430 steps for fp32, 51 for fp16, 6 for bf16, 25
-    for Bfp8_b. The measurement is the gate: no headroom over it, so any movement at
-    all fails the nightly, and a worse figure is recorded by a re-emit, which the PR
-    guard reads as a raise. ``("tolerance", measured)`` once the measurement is past
-    the ceiling: a step budget there would no longer be *tighter* than the tolerance it
-    replaces, and since the ULP arm of ``passed_test`` returns before both isclose and
-    PCC, it would be the whole gate. Decided per cell and before collapsing, because
-    it depends on the output format and collapsing may drop it.
-
-    Without the ceiling the sweep enrols what it should not. ``Abs`` measures 393 steps
-    on a Bfp8_b output from a bf16 input -- the block exponent quantizing a small
-    element, not the op -- and a 393-step budget on a format whose ceiling is 25 gates
-    nothing.
+    ``usable_budget_ceiling`` -- 419,430 steps for fp32, 51 for fp16, 6 for bf16. The
+    measurement is the gate: no headroom over it, so any movement at all fails the
+    nightly, and a worse figure is recorded by a re-emit, which the PR guard reads as a
+    raise. ``("tolerance", measured)`` once the measurement is past the ceiling: a step
+    budget there would no longer be *tighter* than the tolerance it replaces, and since
+    the ULP arm of ``passed_test`` returns before both isclose and PCC, it would be the
+    whole gate. Decided per cell and before collapsing, because it depends on the
+    output format and collapsing may drop it.
     """
     from helpers.format_config import DataFormat
     from helpers.sfpu_accuracy_budget import usable_budget_ceiling
-    from helpers.ulp import _ULP_PROXY_DTYPES
 
-    if DataFormat[out_fmt] in _ULP_PROXY_DTYPES:
-        # reason: block composition, not the size of the number
-        # A block float never enrols from *this* sweep, whatever it measures. The sweep
-        # enumerates a format in value order, so sixteen adjacent values share a block
-        # and the exponent fits all of them -- which is the best case for quantization,
-        # not a representative one. Measured the two ways: `Abs` reads 15616 steps on a
-        # Bfp8_b output from random mixed-magnitude blocks (the table's Bfp8_b note) and
-        # 393 from the sorted sweep. Enrolling the second would hide the first.
-        return ("block", measured)
     if measured > usable_budget_ceiling(DataFormat[out_fmt]):
         return ("tolerance", measured)
     return ("ulp", measured)
@@ -1441,9 +1362,9 @@ def _collapse(decided: Dict[Tuple, Tuple]) -> List[dict]:
 
     Only ``approx`` and ``dest`` may be dropped. ``in`` and ``out`` stay pinned even
     when every value agrees, because the sweep drives a fixed set of formats: a row that
-    wildcards the output would, by most-specific-wins, also answer for the block floats
-    below Bfp8_b and for any format a driver adds later, which nothing here measured. `Abs` losing its
-    Float32 row that way is what the registry's unswept-architecture guard caught.
+    wildcards the output would, by most-specific-wins, also answer for any format a
+    driver adds later, which nothing here measured. `Abs` losing its Float32 row that
+    way is what the registry's unswept-architecture guard caught.
     """
     axes = KEY_AXES
     keep = [0, 1]
@@ -1621,11 +1542,11 @@ _RENDERABLE_FIELDS = frozenset(
 )
 
 
-def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
+def _written_row(row: dict) -> Tuple[Dict[str, object], str]:
     """One decided row's fields, and the comment it carries: only what no field holds
     -- a not-measurable cell's lanes, the floor a demotion tried. A cell with a per-
-    element ULP is written as its ``domains`` list and nothing else beside the key and
-    the run (``ulp_domains``): the list is the statement, and its entries were measured
+    element ULP is written as its ``domains`` list and nothing else beside the key
+    (``ulp_domains``): the list is the statement, and its entries were measured
     outside the floor, so the floor is written whatever the whole-cell verdict. On any
     other row the figure is ``measured``, which on a ULP row is the gate. A floor is
     written exactly as derived (``repr``), with no margin to go stale."""
@@ -1636,7 +1557,6 @@ def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
     if domains:
         if extra is not None and extra[0] in ("floor", "floor_short"):
             fields["near_zero_atol"] = repr(float(extra[1]))
-        fields.update(Provenance(run=run).as_fields())
         fields[DOMAINS_FIELD] = domains
         return fields, ""
     if metric != "ulp":
@@ -1646,7 +1566,6 @@ def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
     provenance = Provenance(
         measured=row["measured"],
         nonfinite=(value.nonfinite or None) if metric == "unmeasurable" else None,
-        run=run,
     )
     fields.update(provenance.as_fields())
     comment = ""
@@ -1657,14 +1576,14 @@ def _written_row(row: dict, run: date) -> Tuple[Dict[str, object], str]:
     return fields, comment
 
 
-def _render(key_line: str, rows: List[dict], run: date) -> List[str]:
+def _render(key_line: str, rows: List[dict]) -> List[str]:
     """One op's block: its key line exactly as it was, and each row with its verdict and
-    the measurement behind it, credited to *run*. Rebuilding the key line from the op's
+    the measurement behind it. Rebuilding the key line from the op's
     name and header dropped anything between the two -- an ``&anchor`` another op's
     ``*alias`` names, after which the table no longer loads."""
     out = [key_line if key_line.endswith("\n") else key_line + "\n"]
     for row in rows:
-        out.append(render_row(*_written_row(row, run)))
+        out.append(render_row(*_written_row(row)))
     return out
 
 
@@ -1738,9 +1657,8 @@ def _block_end(lines: List[str], start: int) -> int:
     return end
 
 
-def write_table(path, run: date) -> WriteReport:
-    """Replace every swept op's block with what the sweep measured, credited to *run*;
-    line-oriented, so the table's prose survives, with rows located by
+def write_table(path) -> WriteReport:
+    """Replace every swept op's block with what the sweep measured; line-oriented, so the table's prose survives, with rows located by
     :class:`BudgetTable`. Raises :class:`UnplacedMeasurements` for an op with no key
     line, after writing every op that has one."""
     path = Path(path)
@@ -1796,10 +1714,10 @@ def write_table(path, run: date) -> WriteReport:
             kept_verbatim[name] = ", ".join(why)
             i = end
             continue
-        out.extend(_render(lines[i], _collapse(_decide(cells, DOMAINS.get(name))), run))
+        out.extend(_render(lines[i], _collapse(_decide(cells, DOMAINS.get(name)))))
         # Rows this run did not supersede -- a format it does not reach, an arch-keyed
-        # entry -- are the measurement of a different run and stay as they are, naming
-        # it. Replacing a whole op block deleted them.
+        # entry -- are the measurement of a different run and stay as they are.
+        # Replacing a whole op block deleted them.
         for row in block.rows:
             if not _replaceable(row, emitted_cells):
                 out.extend(lines[row.first_line : row.last_line + 1])

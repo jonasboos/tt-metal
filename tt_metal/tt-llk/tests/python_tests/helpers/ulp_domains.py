@@ -6,7 +6,7 @@
 One line of ``sfpu_accuracy_budget.yaml`` says how an op behaves over the whole swept
 range of one format combination::
 
-    - {in: Float16_b, out: Float16_b, approx: "Yes", dest: "No", run: 2026-10-20,
+    - {in: Float16_b, out: Float16_b, approx: "Yes", dest: "No",
        domains: [{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10},
                  {low: 1, high: .inf, ulp: 3}]}
 
@@ -46,36 +46,23 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 DOMAINS_FIELD = "domains"
 
 #: What a row with a list may not carry: the list is the whole statement of what was
-#: measured and what gates, so a cell-level figure, metric or sample date beside it
-#: would be a second statement to drift from the first. The registry's loader and the
-#: PR guard both read it here.
-NOT_BESIDE_DOMAINS = (
-    "measured",
-    "metric",
-    "max_ulp",
-    "sampled",
-    "atol",
-    "rtol",
-    "nonfinite",
-)
-
-#: The outputs a list may describe: those with a per-element ULP, which is
-#: ``ulp.has_ulp_gate`` less the block float, whose ULP is a proxy. Spelled out because
-#: this module may not import ``ulp``; a host test ties the two together.
-LIST_OUTPUTS = frozenset({"Float16_b", "Float16", "Float32"})
+#: measured and what gates, so a cell-level figure or metric beside it would be a second
+#: statement to drift from the first. The registry's loader and the PR guard both read
+#: it here.
+NOT_BESIDE_DOMAINS = ("measured", "metric", "atol", "rtol", "nonfinite")
 
 #: An entry's keys, in the order they are written.
 ENTRY_KEYS = ("low", "high", "ulp")
 
-#: ``sfpu_accuracy_budget.usable_budget_ceiling`` by output format name: the largest
-#: figure that is still *tighter* than the tolerance it replaces. Spelled out because
-#: this module may not import the registry; a host test ties the two together. An output
-#: not listed here has no per-element ULP and no list.
+#: ``sfpu_accuracy_budget.usable_budget_ceiling`` by format name: the largest figure
+#: that is still *tighter* than the tolerance it replaces. Its keys are the formats a
+#: row may name (``ulp.ULP_FORMATS``), in and out: the SFPU computes in 16- and 32-bit
+#: floats, and a block float's error is the unpacker's and packer's, not the op's.
+#: Spelled out because this module may not import the registry; a host test ties them.
 CEILINGS: Dict[str, float] = {
     "Float16_b": 6.0,
     "Float16": 51.0,
     "Float32": 419430.0,
-    "Bfp8_b": 25.0,
 }
 
 #: How finely the gateable range is split. ``None`` is the binary rule: a binade is

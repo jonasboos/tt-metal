@@ -17,8 +17,10 @@ match any value, the most specific key wins, and two equally specific matches ar
 authoring error rather than a tie-break.
 
 **Enrolment is per op and incremental.** An op with no entry gets
-:data:`TOLERANCE_CONTRACT`, and so does any request for a format with no per-element
-ULP -- which is how the block floats keep their block-aware lattice compares.
+:data:`TOLERANCE_CONTRACT`. A step budget binds only between the formats the SFPU
+computes in (``ulp.ULP_FORMATS``): a block float's error is the unpacker's and packer's,
+not the op's, so a variant with one keeps the op's declared tolerance, and no row may
+name one.
 
 **Numbers are measured, not guessed**, and every unkeyed number came from
 :data:`MEASURED_ARCH`; a ULP row binds elsewhere only if its own key names that
@@ -43,16 +45,14 @@ from .chip_architecture import ChipArchitecture
 from .format_config import DataFormat, InputOutputFormat
 from .llk_params import ApproximationMode, DestAccumulation, MathOperation
 from .ulp import (  # FLUSH_SUBNORMAL_OUTPUTS re-exported: the step gates read it here
-    _ULP_PROXY_DTYPES,
     FLUSH_SUBNORMAL_OUTPUTS,
     MANTISSA_BITS_FOR_ULP,
     MAX_MEANINGFUL_ULP,
-    has_ulp_gate,
+    ULP_FORMATS,
     ulp_dtype,
 )
 from .ulp_domains import (
     DOMAINS_FIELD,
-    LIST_OUTPUTS,
     NOT_BESIDE_DOMAINS,
     Domain,
     check_domains,
@@ -329,7 +329,7 @@ def usable_budget_ceiling(output_format: DataFormat) -> float:
 
     The real bound is the ``rtol`` half of the ``isclose`` this replaces, itself a step
     budget at large magnitude, rounded *down* to a whole step because a budget is one:
-    419,430 steps for fp32, 51 for fp16, 6 for bf16, 25 for Bfp8_b. Down, not up: a
+    419,430 steps for fp32, 51 for fp16, 6 for bf16. Down, not up: a
     step is widest relative to the value at the bottom of a binade, where bf16's 6.4
     lets ``isclose`` accept ``128 -> 134`` and refuse ``128 -> 135``, so a 7-step budget
     would pass what the tolerance it displaced rejected, with no PCC behind it.
@@ -344,8 +344,8 @@ def usable_budget_ceiling(output_format: DataFormat) -> float:
 
 def _list_contract(where: str, row: Dict[str, Any]) -> AccuracyContract:
     """A row with a ``domains`` list as the contract it implies (``ulp_domains``). The
-    row pins the formats it was measured on and names its run; the metric and the
-    whole-cell figure come from the entries."""
+    row pins the formats it was measured on; the metric and the whole-cell figure come
+    from the entries."""
     for field in NOT_BESIDE_DOMAINS:
         if field in row:
             raise ValueError(
@@ -357,16 +357,7 @@ def _list_contract(where: str, row: Dict[str, Any]) -> AccuracyContract:
             f"{where}: a `{DOMAINS_FIELD}` list needs the row to pin `in` and `out`, "
             "the formats it was measured on"
         )
-    if "run" not in row:
-        raise ValueError(
-            f"{where}: a `{DOMAINS_FIELD}` list names the `run` that measured it"
-        )
-    check_provenance(where, row, tolerance=True)  # the date's own checks
     out_fmt = _enum_member(DataFormat, row["out"], where)
-    if out_fmt.name not in LIST_OUTPUTS:
-        raise ValueError(
-            f"{where}: {out_fmt.name} has no per-element ULP, so no `{DOMAINS_FIELD}`"
-        )
     domains = check_domains(where, row[DOMAINS_FIELD])
     metric, figure = contract_of(domains, usable_budget_ceiling(out_fmt))
     if row.get("near_zero_atol") is not None:
@@ -377,6 +368,11 @@ def _list_contract(where: str, row: Dict[str, Any]) -> AccuracyContract:
         near_zero_atol=row.get("near_zero_atol"),
         domains=domains,
     )
+
+
+def _in_ulp_formats(*formats: Optional[DataFormat]) -> bool:
+    """Whether every format named is one the SFPU computes in; an unset one is."""
+    return all(f is None or f in ULP_FORMATS for f in formats)
 
 
 def _enum_member(enum_cls: Type[E], value: Any, where: str) -> E:
@@ -433,6 +429,12 @@ def _row_to_entry(
             if short in row
         }
     )
+    if not _in_ulp_formats(key.input_format, key.output_format):
+        raise ValueError(
+            f"{where}: a row names only {', '.join(f.name for f in ULP_FORMATS)}, the "
+            "formats the SFPU computes in; a block float's error is the unpacker's and "
+            "packer's"
+        )
     if DOMAINS_FIELD in row:
         return key, _list_contract(where, row)
     contract = {field: row[field] for field in _CONTRACT_FIELDS if field in row}
@@ -568,10 +570,10 @@ def accuracy_contract(
         return TOLERANCE_CONTRACT
     key, contract = found
     if contract.metric is Metric.ULP:
-        # A step count binds only where the format has a per-element ULP (block floats
-        # keep their lattice compares) and on the arch it was measured on: MEASURED_ARCH
-        # for an unkeyed row, or the arch the row's own key names.
-        if has_ulp_gate(output_format) and (
+        # A step count binds only between the formats the SFPU computes in, and on the
+        # arch it was measured on: MEASURED_ARCH for an unkeyed row, or the arch the
+        # row's own key names.
+        if _in_ulp_formats(input_format, output_format) and (
             arch == MEASURED_ARCH or key.arch is not None
         ):
             return contract
@@ -654,15 +656,15 @@ def domains_of(
     dest_acc: Optional[DestAccumulation] = None,
 ) -> Tuple[Tuple[Domain, ...], Optional[float]]:
     """The ``domains`` list one variant is held to, with the row's near-zero floor, or
-    ``((), None)``: an op with no rows, a row without a list, an output with no
-    per-element ULP, or an architecture the row does not bind on (an unkeyed row is a
+    ``((), None)``: an op with no rows, a row without a list, or an architecture the
+    row does not bind on (an unkeyed row is a
     :data:`MEASURED_ARCH` measurement, as for :func:`accuracy_contract`).
 
     Pure, unlike :func:`accuracy_contract`: it publishes no query, so the sweep driver
     calls it beside its one lookup without making that lookup ambiguous.
     """
     table = _SFPU_ACCURACY_BUDGET.get(op)
-    if table is None or not has_ulp_gate(output_format):
+    if table is None:
         return (), None
     query = BudgetKey(
         approx_mode=approx_mode,
@@ -696,7 +698,7 @@ def validate_registry() -> None:
     # Per op, an axis is the values its own rows pin, plus None: any other value matches
     # exactly the rows None matches, so it repeats a query already made. Output format
     # and arch stay whole because accuracy_contract reads their real values on the
-    # downgrade path (has_ulp_gate, MEASURED_ARCH). Measured on a 4,348-row table: ~2 s
+    # downgrade path (ULP_FORMATS, MEASURED_ARCH). Measured on a 4,348-row table: ~2 s
     # this way against 12 s over the enum cross-product, with the same matched sets.
     for op, table in _SFPU_ACCURACY_BUDGET.items():
 

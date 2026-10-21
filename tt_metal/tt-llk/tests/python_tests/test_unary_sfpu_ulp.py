@@ -10,8 +10,9 @@ them: it cannot see a tail the sample never reaches.
 
 One device run per variant covers the whole format: 65,025 bfloat16 values or 61,441
 float16 ones -- every normal value and zero -- in 64 tiles; subnormals are not fed,
-since the unpack flushes them. ``Bfp8_b`` is swept in bfloat16 and packed on the way in; a ``Float32``
-input has 2**32 values, so it is walked with a stride instead.
+since the unpack flushes them. A ``Float32`` input has 2**32 values, so it is walked
+with a stride instead. Only the formats the SFPU computes in are swept: a block float's
+error is the unpacker's and packer's, not the op's.
 Marked ``accuracy``, which every LLK workflow deselects, so it runs only by name or with
 ``-m accuracy``. Run it as a gate::
 
@@ -75,7 +76,7 @@ from helpers.test_variant_parameters import (
     TILE_COUNT,
     generate_input_dim,
 )
-from helpers.ulp import _ULP_PROXY_DTYPES, ulp_distance, ulp_stats
+from helpers.ulp import ulp_distance, ulp_stats
 from helpers.ulp_budget_diff import RECORDED_SKIP
 from helpers.ulp_domains import number_text, partition
 from helpers.ulp_sweep import (
@@ -92,7 +93,6 @@ from helpers.ulp_sweep import (
     padding_lanes,
     ranked_mask,
     received_inputs,
-    stimuli_format_for,
     sweep_cells,
     sweep_spec,
 )
@@ -129,11 +129,10 @@ def run_sweep(mathop, formats, approx_mode, dest_acc):
     """One variant on hardware, over every value of a 16-bit input or a stride of a
     Float32 one (``ulp_sweep.is_exhaustive``). Returns ``(src, golden, result)``."""
     torch.manual_seed(0)
-    stimuli_format = stimuli_format_for(formats.input_format)
     src_A, tile_cnt_A, src_B, tile_cnt_B = generate_stimuli(
-        stimuli_format_A=stimuli_format,
+        stimuli_format_A=formats.input_format,
         input_dimensions_A=SWEEP_DIMENSIONS,
-        stimuli_format_B=stimuli_format,
+        stimuli_format_B=formats.input_format,
         input_dimensions_B=SWEEP_DIMENSIONS,
         spec_A=sweep_spec(formats.input_format),
     )
@@ -340,7 +339,6 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
     # as the cell's residual does.
     x = received_inputs(src, in_fmt, out_fmt, dest_acc).to(torch.float64)
     present = ~padding_lanes(src, in_fmt)
-    per_element = out_fmt not in _ULP_PROXY_DTYPES  # a block output gets no list
 
     if ulp_sweep.EMIT:
         # A cell that only a near-zero lane demotes is recorded with the floor that
@@ -350,13 +348,11 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
         floor = near_zero_floor(golden, result, distance, mask, out_fmt)
         covered = floor_covered(golden, result, mask, floor[1] if floor else None)
         judged = mask & ~covered
-        drawn, bins = (), None
-        if per_element:
-            # The profile counts a lane the floor covers as ranked at 0 steps: it is
-            # held, by the floor, so it draws no edge of its own, and the entry it falls
-            # in is figured over the lanes outside the floor, as the cell is.
-            bins = binade_maxima(x, floored_distance(distance, covered), mask, present)
-            drawn = domain_figures(partition(bins, ceiling), x, distance, mask, judged)
+        # The profile counts a lane the floor covers as ranked at 0 steps: it is held,
+        # by the floor, so it draws no edge of its own, and the entry it falls in is
+        # figured over the lanes outside the floor, as the cell is.
+        bins = binade_maxima(x, floored_distance(distance, covered), mask, present)
+        drawn = domain_figures(partition(bins, ceiling), x, distance, mask, judged)
         _record_ulp_measurement(
             distance,
             mask=mask,

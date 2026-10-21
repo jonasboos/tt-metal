@@ -65,12 +65,11 @@ is the format's.
 |---|---|---|---|
 | `Float16_b` | yes | yes | all 65,025 values: every normal one, and zero |
 | `Float16` | yes | yes | all 61,441 values: every normal one, and zero |
-| `Bfp8_b` | yes | yes | swept in bfloat16, packed on the way in |
-| `Bfp4_b` | yes | **no** | swept in bfloat16, packed on the way in |
 | `Float32` | yes | yes | **strided**, not exhaustive — see below |
 
-`Bfp4_b` is input-only: it keeps 2 fractional bits, so a bfloat16 step count would read
-every legal quantization of a `Bfp4_b` *output* as a 32-step error.
+Those are the formats the SFPU computes in. A block float (`Bfp8_b`, `Bfp4_b`) is not
+swept and no row names one: its error is the unpacker's and packer's, not the op's, so
+a variant with one keeps the op's declared tolerance.
 
 Binary, ternary and scalar rows are measured over those drivers' own sweeps, and those
 drivers gate on the whole contract, `Float32` included. So do the unary signbit, isinf/isnan
@@ -89,7 +88,7 @@ sweep strides the format's total order instead. Every binade holds the same numb
 representable values, so each gets an equal share: one run reaches 261 binades from 0 to
 3.4e38. Ask `ulp_sweep.is_exhaustive(input_format)` if you need to know which you got.
 
-On Wormhole and Blackhole an exponent-B input (`Float16_b`, `Bfp8_b`, `Bfp4_b`) packed to
+On Wormhole and Blackhole an exponent-B input (`Float16_b`) packed to
 `Float16` needs a 32-bit Dest, so the sweep runs those cells with `dest_acc=Yes` only:
 asked for `No`, the harness would run the `Yes` kernel anyway.
 
@@ -111,9 +110,7 @@ keeps only the lanes the op *claims* (below):
   65504 (about 44% of the strided lanes). The sweep feeds no subnormal of its own --
   the hardware flushes them and the golden does not, so `ceil(5.69e-39)` read 1 in the
   model and 0 on silicon, 16,129 bfloat16 steps, once the whole of `Ceil`'s, `Floor`'s
-  and `Sqrt`'s apparent error -- but a `Bfp8_b` block's shared exponent can still make
-  a swept normal subnormal on the way in, so the input is judged as the block-float
-  quantizer hands it to the golden as well as as generated;
+  and `Sqrt`'s apparent error;
 - **answers the Dest lost** (`dest_holds`) — a `Float16` input runs on an fp16 Dest,
   which tops out at 65504 and flushes below 2^-14 whatever the output. Under a `Float32`
   or `Float16_b` output the hardware hands back 65536 (or NaN) where the answer was
@@ -166,9 +163,9 @@ keeps IEEE fp16 subnormals that the pack path does not reproduce, and an exact o
 
 ### 1. Check it can be gated at all
 
-A step count needs a per-element ULP, which means a float output. `ulp.has_ulp_gate(fmt)`
-is the authority. Integer formats want bit equality; `Bfp4_b`, `Bfp2_b` and the MX
-formats keep their block-aware lattice compares.
+A step count needs a format the SFPU computes in: `Float16_b`, `Float16` or `Float32`
+(`ulp.ULP_FORMATS`), in and out. Integer formats want bit equality; the block floats
+and the MX formats keep their block-aware lattice compares.
 
 Your op also has to be in `sfpu_domains.sfpu_unary_ops()` and have a registered domain,
 or the sweep has nothing to feed it.
@@ -200,15 +197,13 @@ writes nothing.
 
 ```yaml
 MyOp:
-  - {in: Float16_b, out: Float16_b, run: 2026-09-23, domains: [{low: -.inf, high: .inf, ulp: 1}]}
-  - {in: Float16, out: Float16_b, run: 2026-09-23, domains: [{low: -.inf, high: -4, ulp: 14337}, {low: -4, high: .inf, ulp: 1}]}
-  - {in: Float16_b, out: Bfp8_b, metric: tolerance, measured: 393, run: 2026-09-23}
+  - {in: Float16_b, out: Float16_b, domains: [{low: -.inf, high: .inf, ulp: 1}]}
+  - {in: Float16, out: Float16_b, domains: [{low: -.inf, high: -4, ulp: 14337}, {low: -4, high: .inf, ulp: 1}]}
 ```
 
-Every row records `run`, the day the sweep measured it (a functional driver's row says
-`sampled:` instead), and what it measured: a `domains` list on every cell with a
-per-element ULP, or a `measured` figure on the rest. A figure *is* the gate: there is
-no headroom over it. The comment is for people. Five verdicts:
+Every row records what was measured: a `domains` list on every cell the sweep drives,
+or a `measured` figure on the rest. A figure *is* the gate: there is no headroom over
+it. The comment is for people. Four verdicts:
 
 - **`domains: [{low: L, high: H, ulp: U}, …]`** — every cell with a per-element ULP,
   one list over the whole swept range ("Where an op holds its figure", below). An entry
@@ -238,12 +233,6 @@ no headroom over it. The comment is for people. Five verdicts:
   `measured` is what the headroom report holds it to. A list whose largest figure is
   past the ceiling implies the same for its whole cell, while its entries within the
   ceiling stay gated.
-- **`metric: tolerance, measured: N`** on a block-float output — block-quantized. The sweep
-  enumerates a format in value order, so sixteen adjacent values share a `Bfp8_b` block
-  and the exponent fits all of them: the best case for quantization, not a
-  representative one. `Abs` reads **15,616 steps** there from random mixed-magnitude
-  blocks (the table's `Bfp8_b` note) and **393** from the sorted sweep of a bfloat16
-  input, so neither number is enrollable.
 - **`metric: tolerance, measured: N, nonfinite: L`**, "not measurable: …" — `L` lanes
   disagreed with the golden about being finite where the op claims an answer (inf/NaN
   against a finite golden, or a finite answer to an infinite one), or the cell had no
@@ -268,11 +257,10 @@ pytest test_sfpu_accuracy_budget.py test_ulp_sweep.py test_ulp_provenance.py -q
 ## The rules the table enforces
 
 - **No number is a guess, and the measurement is the number.** A ULP row's gate is its
-  `measured` figure, with the `run`/`sampled` date it came from; the loader refuses one
-  without them. There is no headroom: a worse measurement is a raised gate, recorded by
-  a re-emit in a change of its own. The comment beside a row is prose; no code reads it.
-  `python3 helpers/ulp_budget_diff.py diff --base <old.yaml> --head <new.yaml>` lists
-  every cell a change loosens and whether its date moved with it.
+  `measured` figure; the loader refuses one without it. There is no headroom: a worse
+  measurement is a raised gate, recorded by a re-emit in a change of its own. The
+  comment beside a row is prose; no code reads it. `python3 helpers/ulp_budget_diff.py
+  diff --base <old.yaml> --head <new.yaml>` lists every cell a change loosens.
 - **Most specific key wins.** A row's key fields are `in`, `out`, `approx`, `dest` and
   `arch`, all optional. Two rows matching one variant equally specifically are an
   authoring error, not a tie-break, and the loader refuses them.
@@ -283,9 +271,9 @@ pytest test_sfpu_accuracy_budget.py test_ulp_sweep.py test_ulp_provenance.py -q
 - **A gate is a measurement, swept or sampled.** The drivers seed their stimuli, so a
   sampled row's figure is reproducible and gates like the sweep's; neither carries an
   envelope.
-- **The list is the statement.** A row with `domains` carries no `measured`, `metric`
-  or `sampled` beside it, pins the `in` and `out` it was measured on, and names its
-  `run`; the loader refuses anything else. An entry never widens or narrows what the op
+- **The list is the statement.** A row with `domains` carries no `measured` or `metric`
+  beside it and pins the `in` and `out` it was measured on; the loader refuses anything
+  else. An entry never widens or narrows what the op
   claims (`claimed_lanes`): it reports where the claim holds, and at what figure.
 - **A gated cell is not parked quietly.** A `not measurable` verdict on a gateable output
   has to be acknowledged in `_UNMEASURABLE_CELLS_ACKNOWLEDGED` with its cause, or the
@@ -298,10 +286,6 @@ pytest test_sfpu_accuracy_budget.py test_ulp_sweep.py test_ulp_provenance.py -q
   the datapath moved. `test_an_exact_op_never_carries_a_wide_budget` holds their
   budgets, and `test_every_swept_cell_of_an_exact_op_is_gated_or_waived` holds the cells
   demoted to tolerance to an explicit list, each with its measurement.
-- **`Bfp8_b` charges for block quantization.** A budget there is denominated in bfloat16
-  steps, two to one `Bfp8_b` step, and does not forgive the shared exponent. No cell
-  with a `Bfp8_b` output is gated by steps: the sweep records its measurement and the
-  cell stays on tolerance, whose lattice compare is the stronger criterion there.
 
 ## Not enrolling an op
 
@@ -334,11 +318,11 @@ One line per format combination says how the op behaves over the whole swept ran
 
 ```yaml
 Tanh:
-  - {in: Float16_b, out: Float16_b, approx: "Yes", dest: "No", run: 2026-10-20, domains: [{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]}
+  - {in: Float16_b, out: Float16_b, approx: "Yes", dest: "No", domains: [{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]}
 Log:
-  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-20, domains: [{low: -.inf, high: 0, ulp: null}, {low: 0, high: .inf, ulp: 1}]}
+  - {in: Float16_b, out: Float16_b, dest: "No", domains: [{low: -.inf, high: 0, ulp: null}, {low: 0, high: .inf, ulp: 1}]}
 Abs:
-  - {in: Float16_b, out: Float16_b, dest: "No", run: 2026-10-20, domains: [{low: -.inf, high: .inf, ulp: 0}]}
+  - {in: Float16_b, out: Float16_b, dest: "No", domains: [{low: -.inf, high: .inf, ulp: 0}]}
 ```
 
 Read: approximate `tanh` is 3 steps everywhere except on `[-1, 1)`, where it is 10,
@@ -347,8 +331,8 @@ gated, and the two others are gated at 3. `log` answers nothing below 0 and is 1
 from 0 up. `abs` is exact over the whole range.
 
 - **An entry** `{low: L, high: H, ulp: U}` holds the lanes whose input, *as the kernel
-  received it* (`ulp_sweep.received_inputs`: block-quantized for `Bfp8_b`/`Bfp4_b`,
-  truncated to the 16-bit Dest for a `Float32` input at `dest: "No"`), satisfies
+  received it* (`ulp_sweep.received_inputs`: truncated to the 16-bit Dest for a
+  `Float32` input at `dest: "No"`), satisfies
   `L <= x < H`. `U` is the worst ranked lane there, outside the row's near-zero floor
   if it has one; `null` means too few lanes there are ranked to draw an edge on (fewer
   than `DOMAIN_MIN_BIN_LANES` in each of its binades): past the op's claim (`cos`
@@ -356,7 +340,8 @@ from 0 up. `abs` is exact over the whole range.
   answer the Dest cannot hold. The few ranked lanes a `null` entry can still hold are
   gated at the row's largest figure, so the emitter writes `null` only while they fit
   it; otherwise the entry whose strays are worst carries its own figure. A cell where
-  no entry would carry a figure gets a plain row, not a list. Which lanes an op claims stays in code
+  no entry would carry a figure gets a plain row, not a list. Which lanes an op claims
+  stays in code
   (`_CLAIM_LIMIT`, `_OP_SINGULARITIES`, `_NONPOSITIVE_INTEGER_POLES`); the list reports
   it.
 - **Gated or not follows the figure.** An entry within `usable_budget_ceiling` of the

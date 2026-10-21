@@ -4,11 +4,11 @@
 """The SFPU accuracy table as rows, and each row's provenance as fields.
 
 Every row of ``sfpu_accuracy_budget.yaml`` that carries a budget says which measurement
-it came from in fields of its own -- ``measured``, ``nonfinite``, and ``run`` or
-``sampled`` -- which PyYAML loads and the registry loader validates like any other
-field. On a ULP row ``measured`` is the gate itself: there is no second number. A
-row the exhaustive sweep wrote carries its ``domains`` list instead (``ulp_domains``),
-and no cell-level figure at all. The comment beside a row is prose for people; no code reads it.
+it came from in fields of its own -- ``measured`` and ``nonfinite`` -- which PyYAML
+loads and the registry loader validates like any other field. On a ULP row
+``measured`` is the gate itself: there is no second number. A row the exhaustive sweep
+wrote carries its ``domains`` list instead (``ulp_domains``), and no cell-level figure
+at all. The comment beside a row is prose for people; no code reads it.
 :class:`Provenance` is the typed view of the fields, and :class:`BudgetTable` is the one
 walk over the file, locating rows through PyYAML's own event stream rather than by the
 shape of a line.
@@ -20,7 +20,6 @@ guard (``ulp_budget_diff.py``) runs on a slim runner and imports it by path.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -89,7 +88,7 @@ def _merged_keys(node: yaml.Node) -> set:
 def refuse_merged_provenance(node: yaml.Node, where: str) -> None:
     """A ``<<`` merge row is a cell of its own, so its measurement must be its own too:
     a provenance field that reaches it only through the merge would credit it with the
-    anchor's figure and date. A plain ``*alias`` row *is* the anchor's row, and shares
+    anchor's figure. A plain ``*alias`` row *is* the anchor's row, and shares
     its measurement by design. Checked on the composed node tree, before construction
     resolves the merges away."""
     if isinstance(node, yaml.MappingNode):
@@ -147,17 +146,10 @@ class Provenance:
       the lanes it could.
     * ``nonfinite`` -- lanes disagreeing with the golden about being finite, which hold
       the row's cell on tolerance; the headroom report fails a run in which it grows.
-    * ``run`` -- the day the sweep measured the row, on ``MEASURED_ARCH`` (or the row's
-      own ``arch``): every value of a 16-bit input, a stride of a Float32 one.
-    * ``sampled`` -- the day a functional driver's sample measured it instead. The
-      drivers seed their stimuli, so the figure is reproducible and gates like the
-      sweep's.
     """
 
     measured: Optional[int] = None
     nonfinite: Optional[int] = None
-    run: Optional[date] = None
-    sampled: Optional[date] = None
 
     @classmethod
     def of(cls, values: Dict[str, Any]) -> "Provenance":
@@ -166,23 +158,10 @@ class Provenance:
         return cls(**{k: values[k] for k in PROVENANCE_FIELDS if k in values})
 
     @property
-    def swept(self) -> bool:
-        """Whether the sweep measured the row, rather than a sample. Not whether it saw
-        every value of its input: a Float32 input is walked with a stride
-        (``ulp_sweep.is_exhaustive``)."""
-        return self.run is not None
-
-    @property
     def unmeasurable(self) -> bool:
-        """Whether the sweep could not measure the row's cell: lanes disagreed with the
-        golden about being finite, or it ran and no lane could be ranked."""
-        return self.nonfinite is not None or (
-            self.run is not None and self.measured is None
-        )
-
-    @property
-    def when(self) -> Optional[date]:
-        return self.run or self.sampled
+        """Whether lanes disagreeing with the golden about being finite held the row's
+        cell on tolerance."""
+        return self.nonfinite is not None
 
     def as_fields(self) -> Dict[str, Any]:
         """The fields to write, in table order, without the unset ones."""
@@ -195,28 +174,12 @@ class Provenance:
     def problems(self) -> List[str]:
         """What is wrong with these fields on their own, as messages; ``[]`` if
         nothing. Combinations with the contract are the loader's to check."""
-        found = []
-        for name, least in (("measured", 0), ("nonfinite", 1)):
-            value = getattr(self, name)
-            if value is not None and not (_is_int(value) and value >= least):
-                found.append(f"`{name}` must be an integer >= {least}, got {value!r}")
-        for name in ("run", "sampled"):
-            value = getattr(self, name)
-            # A datetime is a date too; a row names a day.
-            if value is not None and (type(value) is not date):
-                found.append(
-                    f"`{name}` must be a date (YYYY-MM-DD, unquoted), got {value!r}"
-                )
-        if found:
-            return found
-        if self.run is not None and self.sampled is not None:
-            found.append("a row is measured by the sweep (`run`) or sampled, not both")
-        for name in ("measured", "nonfinite"):
-            if getattr(self, name) is not None and self.when is None:
-                found.append(f"`{name}` needs the `run` or `sampled` date it came from")
-        if self.sampled is not None and self.measured is None:
-            found.append("`sampled` without the `measured` figure it records")
-        return found
+        return [
+            f"`{name}` must be an integer >= {least}, got {value!r}"
+            for name, least in (("measured", 0), ("nonfinite", 1))
+            for value in (getattr(self, name),)
+            if value is not None and not (_is_int(value) and value >= least)
+        ]
 
 
 #: The provenance fields of a row, in the order the emitter writes them: the
@@ -233,10 +196,7 @@ def check_provenance(where: str, row: Dict[str, Any], *, tolerance: bool) -> Non
     provenance = Provenance.of(row)
     problems = provenance.problems()
     if not tolerance and provenance.measured is None:
-        problems.append(
-            "a ulp row's gate is its `measured` figure, with the `run` or `sampled` "
-            "date it was measured on; the row has neither"
-        )
+        problems.append("a ulp row's gate is its `measured` figure; the row has none")
     if provenance.nonfinite is not None and not tolerance:
         problems.append(
             "`nonfinite` lanes hold a cell on tolerance, so it belongs on a "
@@ -377,7 +337,7 @@ class OpBlock:
 
 class BudgetTable:
     """The table as rows, located through PyYAML's event stream: values mean what the
-    loader says they mean (anchors, ``<<`` merges, YAML booleans and dates), and a
+    loader says they mean (anchors, ``<<`` merges, YAML booleans), and a
     row's comment is the text after ``#`` past the end of its node. Tolerant of a
     top-level entry that is not a list of rows -- the guard parses arbitrary base
     revisions; ``_load_table`` is what refuses them."""
@@ -536,7 +496,7 @@ def _field_text(key: str, value: Any) -> str:
 
 def render_row(row_fields: Dict[str, Any], comment: str = "") -> str:
     """One inline row as the emitter writes it, with its newline. ``approx``/``dest``
-    quoted so YAML keeps them strings; a date unquoted so YAML reads it as one; a
-    ``domains`` list in ``ulp_domains``' one spelling."""
+    quoted so YAML keeps them strings; a ``domains`` list in ``ulp_domains``' one
+    spelling."""
     body = ", ".join(_field_text(k, v) for k, v in row_fields.items())
     return f"  - {{{body}}}" + (f"  # {comment}" if comment else "") + "\n"
