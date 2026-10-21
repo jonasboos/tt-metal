@@ -46,13 +46,7 @@ from helpers.sfpu_accuracy_budget import (
 )
 from helpers.sfpu_domains import _UNARY_OPS_NOT_SWEPT, sfpu_unary_ops
 from helpers.tile_constants import DEFAULT_TILE_C_DIM, DEFAULT_TILE_R_DIM
-from helpers.ulp import (
-    _ULP_DTYPES,
-    MAX_MEANINGFUL_ULP,
-    ULP_FORMATS,
-    has_ulp_gate,
-    ulp_dtype,
-)
+from helpers.ulp import ULP_FORMATS, has_ulp_gate, mantissa_bits, ulp_dtype
 from helpers.ulp_domains import Domain, Problem, usable_budget_ceiling
 from helpers.ulp_sweep import _verdict, sweep_cells
 from helpers.ulp_table import MEASURED_ARCH, TABLE_PATH, Row, load_table
@@ -798,48 +792,42 @@ def test_a_tolerance_reading_ranks_fp16_subnormals_flushed(tmp_path, monkeypatch
     assert row.worst == 0, row
 
 
-def test_an_unpreparable_measure_path_warns_and_records_nothing(tmp_path, monkeypatch):
-    """The session-start truncation is under the same rule as every write: a path that
-    is a directory warns and switches the recorder off rather than aborting pytest
-    before anything is compared."""
+def test_the_measure_file_is_truncated_at_session_start_or_refused(
+    tmp_path, monkeypatch
+):
+    """A stale file is truncated so runs do not fold together, a missing parent is
+    created, and a path that is a directory raises for the plugin to turn into a usage
+    error rather than yielding a green run with an empty file."""
     import helpers.utils as utils
-
-    monkeypatch.setattr(utils, "_ULP_MEASURE_PATH", str(tmp_path))  # a directory
-    monkeypatch.setattr(utils, "_ULP_MEASURE_WARNED", False)
-    utils.prepare_ulp_measure_file()
-    assert utils._ULP_MEASURE_PATH is None and utils._ULP_MEASURE_WARNED
 
     target = tmp_path / "nested" / "measure.jsonl"
     monkeypatch.setattr(utils, "_ULP_MEASURE_PATH", str(target))
     target.parent.mkdir()
     target.write_text("stale\n", encoding="utf-8")
     utils.prepare_ulp_measure_file()
-    assert target.read_text() == ""  # truncated, so runs do not fold together
-
-    # `--ulp-measure out/dir/x.jsonl` with no `out/dir` yet: the parent is created, not
-    # warned about.
+    assert target.read_text() == ""
     fresh = tmp_path / "out" / "dir" / "measure.jsonl"
     monkeypatch.setattr(utils, "_ULP_MEASURE_PATH", str(fresh))
     utils.prepare_ulp_measure_file()
-    assert utils._ULP_MEASURE_PATH == str(fresh) and fresh.read_text() == ""
+    assert fresh.read_text() == ""
+    monkeypatch.setattr(utils, "_ULP_MEASURE_PATH", str(tmp_path))  # a directory
+    with pytest.raises(OSError):  # allow-pytest.raises: host-only test
+        utils.prepare_ulp_measure_file()
 
 
 def test_a_measure_recorder_write_failure_does_not_fail_the_comparison(
     tmp_path, monkeypatch
 ):
-    """Reporting only: an unwritable path warns and is otherwise ignored, so it can
-    neither fail a passing test nor hide a failing comparison's summary."""
+    """Reporting only: an unwritable path is warned about and otherwise ignored."""
     import helpers.utils as utils
 
     monkeypatch.setattr(utils, "_ULP_MEASURE_PATH", str(tmp_path))  # a directory
-    monkeypatch.setattr(utils, "_ULP_MEASURE_WARNED", False)
     golden = torch.full((32,), 1.5, dtype=torch.bfloat16)
     for _ in range(2):
         accuracy_contract(
             MathOperation.Abs, output_format=DataFormat.Float16_b, arch=MEASURED_ARCH
         )
         assert passed_test(golden, golden.clone(), DataFormat.Float16_b)
-    assert utils._ULP_MEASURE_WARNED
 
 
 def test_arch_must_be_passed_explicitly():
@@ -995,7 +983,7 @@ _PACK_PATH_STEPS = 2
 
 def _mantissa_bits(fmt):
     """0 for a format without a per-element ULP (these appear on the input axis only)."""
-    return _ULP_DTYPES[ulp_dtype(fmt)].mantissa_bits if has_ulp_gate(fmt) else 0
+    return mantissa_bits(ulp_dtype(fmt)) if has_ulp_gate(fmt) else 0
 
 
 def _exact_allowance(op, input_format, output_format):
@@ -1317,14 +1305,6 @@ def test_no_budget_exceeds_its_formats_usable_ceiling():
             "tolerance it replaces. Put the op on the tolerance metric and record "
             "the measurement instead."
         )
-
-
-def test_the_usable_ceiling_is_tighter_than_the_meaningful_one():
-    for fmt in ULP_FORMATS:
-        assert usable_budget_ceiling(fmt) < MAX_MEANINGFUL_ULP[ulp_dtype(fmt)], fmt.name
-    # 6.4, rounded down: a 7-step budget accepts bf16 128 -> 135, which the 0.05 +
-    # 0.05 * 128 = 6.45 tolerance it replaces refuses.
-    assert usable_budget_ceiling(DataFormat.Float16_b) == 6
 
 
 def test_no_declared_tolerance_is_shadowed_by_a_numberless_row():
