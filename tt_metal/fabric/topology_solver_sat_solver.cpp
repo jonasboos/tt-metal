@@ -49,6 +49,14 @@ struct SatEngine {
     // Protect a variable from bounded-variable-elimination so a later (post-solve) blocking clause over it
     // stays sound. No-op for engines that preserve reusable variables implicitly.
     virtual void protect_variable(int var) = 0;
+    // Switch between incremental (add()/solve() interleaved — required for blocking-clause enumeration) and
+    // one-shot (a single solve, with full inprocessing/variable-elimination). Must be called before the first
+    // add(). Incremental mode freezes bounded-variable-elimination on kissat; one-shot lets it run, which is
+    // dramatically faster when only the first model is needed. Default is incremental.
+    virtual void set_incremental(bool on) = 0;
+    // Bias the engine toward satisfiable-dominated instances (the min-host placement CNFs almost always are).
+    // Must be called before the first add(). No-op on engines without such a profile.
+    virtual void set_sat_configuration() = 0;
 };
 
 // ── CaDiCaL engine (fallback / explicit opt-out; formerly the only engine, and the default before kissat) ──
@@ -108,6 +116,14 @@ struct CadicalSatEngine final : SatEngine {
         // No-op: CaDiCaL preserves variables reachable from incrementally-added clauses implicitly (its
         // restore machinery re-introduces eliminated variables when a later clause references them), so
         // blocking clauses added between solves stay sound without explicit protection.
+    }
+    void set_incremental(bool /*on*/) override {
+        // No-op: CaDiCaL has no explicit incremental toggle (it adapts automatically, and its restore
+        // machinery keeps post-solve clause additions sound). The caller's one-shot path simply omits the
+        // blocking clause, so there is nothing to switch here.
+    }
+    void set_sat_configuration() override {
+        // No-op: CaDiCaL exposes no named 'sat' profile; its default already handles satisfiable instances.
     }
 };
 
@@ -187,6 +203,19 @@ struct KissatSatEngine final : SatEngine {
             kissat_protect(solver, var);
         }
     }
+    void set_incremental(bool on) override {
+        // Must precede the first kissat_add() (options freeze once solving begins). incremental=1 (the ctor
+        // default) is required for add()-after-solve() enumeration; incremental=0 unlocks kissat's
+        // bounded-variable-elimination for a single one-shot solve (the common path only needs one model).
+        // kissat_value() still reconstructs eliminated variables (via kissat_extend), so the model decodes.
+        kissat_set_option(solver, "incremental", on ? 1 : 0);
+    }
+    void set_sat_configuration() override {
+        // KISSAT_SWAP_PLAN.md §8: the min-host placement CNFs are satisfiable-dominated, so bias search toward
+        // finding a model (the 'sat' profile sets --target / --restartint; it does not touch 'incremental').
+        // Must precede the first kissat_add().
+        kissat_set_configuration(solver, "sat");
+    }
 };
 #endif  // TT_METAL_FABRIC_KISSAT
 
@@ -262,6 +291,9 @@ int TopologySatSolver::declare_one_more_variable() {
 }
 
 void TopologySatSolver::protect_variable(int var) { impl_->engine->protect_variable(var); }
+
+void TopologySatSolver::set_incremental(bool on) { impl_->engine->set_incremental(on); }
+void TopologySatSolver::set_sat_configuration() { impl_->engine->set_sat_configuration(); }
 
 void TopologySatSolver::add(int lit) {
     impl_->engine->add(lit);
