@@ -75,6 +75,10 @@ env:
   #                                  ci_run.sh needs the PR and the commits to
   #                                  compare (PR_NUMBER, HEAD_SHA, BASE_SHA), which
   #                                  that workflow's plan job resolves.
+  #   llk_hardware_free_tests.yaml   runs only through llk-hardware-free-impl.yaml,
+  #                                  which installs SFPI and runs the cmd from
+  #                                  tt_metal/tt-llk in the LLK CI image. From /work
+  #                                  the relative ./tests/run_hardware_free.sh misses.
   #
   # This is not an exemption: the legs still block the PR until an owner approves.
   UNSUPPORTED_YAMLS: >-
@@ -89,6 +93,7 @@ env:
     llk_bit_exact_tests.yaml
     llk_perf_tests.yaml
     llk_sfpu_report_tests.yaml
+    llk_hardware_free_tests.yaml
 
   # Yamls under tests/pipeline_reorg/ that legitimately hold no test matrix, so the
   # gate has nothing to prove for them. ttsim-skip-list.yaml is a per-arch mapping of
