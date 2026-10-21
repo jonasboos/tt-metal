@@ -13,9 +13,12 @@ range of one format combination::
 An entry ``{low: L, high: H, ulp: U}`` holds the lanes whose input, as the kernel
 received it, satisfies ``L <= x < H``. ``U`` is the worst ranked lane there, in steps,
 outside the row's near-zero floor if it has one -- the same quantity a plain row's
-``measured`` is, over fewer lanes -- or ``null`` where no lane is ranked: past the op's
-claim (``cos`` beyond 65504), undefined (``log`` below 0), or an answer the Dest cannot
-hold. An entry whose figure is within the output format's usable ceiling
+``measured`` is, over fewer lanes -- or ``null`` where too few lanes are ranked to draw
+an edge on (fewer than :data:`DOMAIN_MIN_BIN_LANES` in each of its binades): past the
+op's claim (``cos`` beyond 65504), undefined (``log`` below 0), or an answer the Dest
+cannot hold. The sweep holds the few ranked lanes a null entry has to the row's largest
+figure, so the emitter writes ``null`` only while they fit it (:func:`entries_of`).
+An entry whose figure is within the output format's usable ceiling
 (:data:`CEILINGS`) is gated at it by the sweep; one past the ceiling is measured and
 held to its figure by the headroom report. The whole-cell contract a caller gets is
 derived: gated at the largest figure when every ranked entry is within the ceiling,
@@ -37,10 +40,29 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 #: The row field that holds the list.
 DOMAINS_FIELD = "domains"
+
+#: What a row with a list may not carry: the list is the whole statement of what was
+#: measured and what gates, so a cell-level figure, metric or sample date beside it
+#: would be a second statement to drift from the first. The registry's loader and the
+#: PR guard both read it here.
+NOT_BESIDE_DOMAINS = (
+    "measured",
+    "metric",
+    "max_ulp",
+    "sampled",
+    "atol",
+    "rtol",
+    "nonfinite",
+)
+
+#: The outputs a list may describe: those with a per-element ULP, which is
+#: ``ulp.has_ulp_gate`` less the block float, whose ULP is a proxy. Spelled out because
+#: this module may not import ``ulp``; a host test ties the two together.
+LIST_OUTPUTS = frozenset({"Float16_b", "Float16", "Float32"})
 
 #: An entry's keys, in the order they are written.
 ENTRY_KEYS = ("low", "high", "ulp")
@@ -77,9 +99,10 @@ DOMAIN_MIN_BIN_LANES = 16
 #: so a narrow bad region is never hidden.
 DOMAIN_MIN_LANES = 1024
 
-#: Makes every float32 binade index positive: 2**-149 is the smallest subnormal, so
-#: ``floor(log2 |x|) + 150`` is at least 1, and the sign of the index is the sign of x.
-BINADE_OFFSET = 150
+#: Makes every float32 binade index positive, so the sign of the index is the sign of
+#: x: the binade of the smallest subnormal, -2**-149, is ``[-2**-149, -2**-150)``, k =
+#: -150 (see :func:`binade`), so ``k + 151`` is at least 1.
+BINADE_OFFSET = 151
 
 _INF = float("inf")
 
@@ -117,19 +140,25 @@ class Domain:
         """Whether the sweep holds this entry's lanes to its figure."""
         return self.ulp is not None and self.ulp <= ceiling
 
-    def contains(self, x: float) -> bool:
-        return self.low <= x < self.high
-
     def as_entry(self) -> Dict[str, Any]:
         return {"low": self.low, "high": self.high, "ulp": self.ulp}
 
 
 def binade(x: float) -> int:
     """The signed binade index of a finite input: 0 for zero, otherwise
-    ``sign(x) * (floor(log2 |x|) + 150)``, which orders binades as the values do."""
+    ``sign(x) * (k + BINADE_OFFSET)`` for the *k* whose binade (:func:`binade_edges`)
+    holds x under the lists' own ``low <= x < high``: ``2**k <= x < 2**(k+1)``, or
+    ``-2**(k+1) <= x < -2**k``. A negative power of two is the *low* edge of the binade
+    above it, as -1 is of ``[-1, -0.5)``, so its k is one less than its magnitude's;
+    otherwise a binade's lanes would straddle an entry's edge. Orders binades as the
+    values do."""
     if x == 0:
         return 0
-    index = math.frexp(abs(x))[1] - 1 + BINADE_OFFSET
+    mantissa, exponent = math.frexp(abs(x))
+    k = exponent - 1
+    if x < 0 and mantissa == 0.5:
+        k -= 1
+    index = k + BINADE_OFFSET
     return index if x > 0 else -index
 
 
@@ -157,8 +186,6 @@ def _step_class(worst: int, ceiling: float):
 def _looseness(cls) -> float:
     if cls == "past":
         return _INF
-    if cls == "unranked":
-        return -1.0
     return 0.0 if cls == "gateable" else float(cls)
 
 
@@ -272,13 +299,46 @@ def partition(
             high = 0.0
         ranked = r["cls"] != "unranked"
         if out and not low < high:
-            # A run of nothing but the zero lane, snapped to [0, 0): give it to the
-            # domain before it rather than write an empty one.
+            # A run of nothing but the zero lane, snapped to [0, 0): dropped rather than
+            # written empty. The next entry's `low` is pulled down to 0 below, so under
+            # `low <= x < high` the zero lane lands in the domain after it.
             continue
         if out and out[-1][1] != low:
             low = out[-1][1]
         out.append((low, high, ranked))
     return tuple(out)
+
+
+def entries_of(
+    spans: Tuple[Tuple[float, float, bool], ...],
+    worst: Callable[[float, float], Optional[int]],
+) -> Tuple[Domain, ...]:
+    """The entries the table writes for :func:`partition`'s *spans*, given *worst(low,
+    high)*: the worst ranked lane in ``[low, high)`` outside the floor (0 where the floor
+    covers every one), ``None`` where none is ranked.
+
+    A ranked span carries its worst lane. An unranked one is ``null``, but it can still
+    hold a few ranked lanes, and the sweep holds those to the row's largest figure; so
+    if any are worse than every figure in the list, the span whose strays are worst
+    carries its own figure instead, and the next run on the same output passes the list
+    it was written with. ``()`` -- no list, a plain row -- when no ranked span measured
+    anything: ``check_domains`` refuses a list without a figure."""
+    figures = [worst(low, high) if ranked else None for low, high, ranked in spans]
+    if all(f is None for f in figures):
+        return ()
+    largest = max(f for f in figures if f is not None)
+    strays = [
+        (stray, i)
+        for i, (low, high, ranked) in enumerate(spans)
+        if not ranked
+        for stray in (worst(low, high),)
+        if stray is not None
+    ]
+    if strays:
+        stray, i = max(strays)
+        if stray > largest:
+            figures[i] = stray
+    return tuple(Domain(low, high, f) for (low, high, _), f in zip(spans, figures))
 
 
 def _is_power_of_two(value: float) -> bool:

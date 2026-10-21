@@ -19,8 +19,6 @@ from helpers.ulp_budget_diff import (
     _MAX_ROWS,
     CONTRACT_FIELDS,
     KEY_FIELDS,
-    LIST_OUTPUTS,
-    NOT_BESIDE_DOMAINS,
     RECORDED_SKIP,
     ULP_GATED_OUTPUTS,
     DuplicateRow,
@@ -40,6 +38,7 @@ from helpers.ulp_budget_diff import (
     render_budget_diff,
     render_headroom,
 )
+from helpers.ulp_domains import BINADE_OFFSET, binade
 from helpers.ulp_provenance import Provenance
 
 #: The tool's short key spelling -> the registry's BudgetKey field. Both of its copies
@@ -194,8 +193,7 @@ def test_a_row_the_sweep_collapses_is_not_a_loss_while_its_cells_keep_their_budg
     # A raise through the collapsed row is one change covering both variants,
     # re-measured because the deciding row's measurement is new.
     raised = _head(
-        '{in: Float16_b, out: Float32, dest: "Yes", measured: 36030, '
-        f"{_LATER_RUN}}}"
+        '{in: Float16_b, out: Float32, dest: "Yes", measured: 36030, ' f"{_LATER_RUN}}}"
     )
     (change,) = [c for c in _changes(base, raised) if c.is_regression]
     assert change.kind == "raised" and change.variants == 2 and change.remeasured
@@ -358,10 +356,10 @@ def test_an_unkeyed_budget_binds_only_on_the_measured_arch():
     names that arch. A guard that treated every ULP row as gating everywhere reported
     the loss of a Blackhole gate as a *tightening* (the unkeyed 3 under the BH 5), and
     its addition as a raise rather than a new gate."""
-    unkeyed = (
-        f"{{in: Float16_b, out: Float16_b, measured: 3, {_RUN}}}  # wormhole"
+    unkeyed = f"{{in: Float16_b, out: Float16_b, measured: 3, {_RUN}}}  # wormhole"
+    bh = (
+        f"{{in: Float16_b, out: Float16_b, arch: BLACKHOLE, measured: 5, {_RUN}}}  # bh"
     )
-    bh = f"{{in: Float16_b, out: Float16_b, arch: BLACKHOLE, measured: 5, {_RUN}}}  # bh"
     on_bh = _BF16 + (("arch", "BLACKHOLE"),)
 
     (lost,) = _changes(_head(unkeyed, bh), _head(unkeyed))
@@ -375,12 +373,8 @@ def test_an_unkeyed_budget_binds_only_on_the_measured_arch():
 def test_an_arch_is_read_by_name_or_by_value():
     """The registry accepts ``arch: wormhole`` and ``arch: WORMHOLE`` alike; the
     measurement rows carry the enum name."""
-    by_value = parse_table(
-        f"Abs:\n  - {{arch: blackhole, measured: 1, {_RUN}}}  # c\n"
-    )
-    by_name = parse_table(
-        f"Abs:\n  - {{arch: BLACKHOLE, measured: 1, {_RUN}}}  # c\n"
-    )
+    by_value = parse_table(f"Abs:\n  - {{arch: blackhole, measured: 1, {_RUN}}}  # c\n")
+    by_name = parse_table(f"Abs:\n  - {{arch: BLACKHOLE, measured: 1, {_RUN}}}  # c\n")
     assert set(by_value) == set(by_name) == {("Abs", (("arch", "BLACKHOLE"),))}
 
 
@@ -509,12 +503,10 @@ def test_an_alias_follows_its_anchor_when_the_anchor_is_re_measured():
     """An alias row counts as re-measured only with a date new to the base, so a
     re-measured anchor still carries its aliases with it."""
     base = parse_table(
-        f"Abs: &low\n  - {{out: Float16_b, measured: 2, {_RUN}}}\n"
-        "Neg: *low\n"
+        f"Abs: &low\n  - {{out: Float16_b, measured: 2, {_RUN}}}\n" "Neg: *low\n"
     )
     head = parse_table(
-        f"Abs: &low\n  - {{out: Float16_b, measured: 9, {_LATER_RUN}}}\n"
-        "Neg: *low\n"
+        f"Abs: &low\n  - {{out: Float16_b, measured: 9, {_LATER_RUN}}}\n" "Neg: *low\n"
     )
     changes = compare(base, head)
     assert [(c.cell[0], c.kind, c.remeasured) for c in changes] == [
@@ -547,8 +539,7 @@ def test_the_guard_refuses_provenance_the_registry_refuses(tmp_path, row, proble
     from an otherwise unchanged table diffed clean while the registry refused to load
     it. It now calls the registry's own contract check, and exits 2."""
     text = (
-        f"Base:\n  - &b {{out: Float16_b, measured: 2, {_RUN}}}\n"
-        f"Abs:\n  - {row}\n"
+        f"Base:\n  - &b {{out: Float16_b, measured: 2, {_RUN}}}\n" f"Abs:\n  - {row}\n"
     )
     with _refuses(ValueError) as caught:
         parse_table(text)
@@ -732,8 +723,7 @@ def test_the_headroom_report_lists_every_failure_and_caps_only_the_better_cells(
     extra = 5
     n = _MAX_ROWS + extra
     table = "Abs:\n" + "".join(
-        f"  - {{in: F{i}, out: Float16_b, measured: 8, {_RUN}}}\n"
-        for i in range(2 * n)
+        f"  - {{in: F{i}, out: Float16_b, measured: 8, {_RUN}}}\n" for i in range(2 * n)
     )
     rows = [
         {"op": "Abs", "in": f"F{i}", "out": "Float16_b", "max": 99} for i in range(n)
@@ -1322,9 +1312,7 @@ def test_a_new_row_without_provenance_of_its_own_is_not_remeasured():
 
 def test_a_step_row_on_an_output_with_no_per_element_ulp_does_not_gate():
     """The registry hands such a cell its tolerance; the tool must not judge it."""
-    table = parse_table(
-        _head(f"{{in: Float16_b, out: Bfp4_b, measured: 393, {_RUN}}}")
-    )
+    table = parse_table(_head(f"{{in: Float16_b, out: Bfp4_b, measured: 393, {_RUN}}}"))
     (row,) = table.values()
     assert not _gates(row, (("in", "Float16_b"), ("out", "Bfp4_b")))
     report, over = render_headroom(table, _measured(("Float16_b", "Bfp4_b", 393)))
@@ -1440,10 +1428,7 @@ def test_a_budget_raised_inside_a_root_merge_is_refused_not_compared_clean(tmp_p
     rows and a raise inside them diffed clean."""
 
     def merged(budget):
-        return (
-            "<<: {Abs: [{out: Float16_b, measured: "
-            f"{budget}, {_RUN}}}]}}\n"
-        )
+        return "<<: {Abs: [{out: Float16_b, measured: " f"{budget}, {_RUN}}}]}}\n"
 
     argv = [
         "diff",
@@ -1610,7 +1595,7 @@ def test_the_headroom_report_judges_each_entry_of_a_list():
     # With the binade profile the rule is applied exactly: 70 lanes spread over five
     # binades at 14 each rank none of them; 16 in one binade does.
     rows[0]["domains"][2][3] = 70
-    rows[0]["bins"] = [[150 + k, 128, 14, 0] for k in range(5)]
+    rows[0]["bins"] = [[BINADE_OFFSET + k, 128, 14, 0] for k in range(5)]
     report, _ = render_headroom(
         table, _measured_cells(rows), entries=_entry_readings(rows)
     )
@@ -1638,7 +1623,7 @@ def test_the_domains_view_redraws_a_list_from_the_recorded_profile(tmp_path, cap
     bins = []
     for k in range(-126, 128):
         for sign in (1, -1):
-            bins.append([sign * (k + 150), 128, 128, 10 if k < 0 else 3])
+            bins.append([sign * (k + BINADE_OFFSET), 128, 128, 10 if k < 0 else 3])
     bins.append([0, 1, 1, 0])
     row = {
         "op": "Tanh",
@@ -1664,12 +1649,212 @@ def test_the_domains_view_redraws_a_list_from_the_recorded_profile(tmp_path, cap
     assert "table: [{low: -.inf, high: -1, ulp: 3}" in out
 
 
-def test_the_list_rules_are_the_registrys():
-    from helpers.format_config import DataFormat
-    from helpers.sfpu_accuracy_budget import _NOT_BESIDE_DOMAINS
-    from helpers.ulp import _ULP_PROXY_DTYPES, has_ulp_gate
-
-    assert NOT_BESIDE_DOMAINS == _NOT_BESIDE_DOMAINS
-    assert LIST_OUTPUTS == {
-        f.name for f in DataFormat if has_ulp_gate(f) and f not in _ULP_PROXY_DTYPES
+def _domains_row(op, bins):
+    """A ``--ulp-measure`` row carrying only a ``bins`` profile, for the domains view."""
+    return {
+        "op": op,
+        "in": "Float16_b",
+        "out": "Float16_b",
+        "approx": "No",
+        "dest": "No",
+        "max": max(w for _, _, _, w in bins),
+        "lanes": sum(r for _, _, r, _ in bins),
+        "nonfinite": 0,
+        "bins": bins,
     }
+
+
+def test_the_domains_view_places_a_negative_power_of_two_where_the_list_does(
+    tmp_path, capsys
+):
+    """-1 is the low edge of [-1, -0.5) under `low <= x < high`, so its binade must be
+    that one: grouping it with (-2, -1) put its 9 steps on the wrong side of a split at
+    -1 and the view drew [9, 1] where the emitter measures [1, 9]."""
+    import json
+
+    profile = {}
+    for x, worst in ((-1.5, 1), (-1.0, 9), (-0.5, 9)):
+        profile[binade(x)] = (2048, 2048, worst)
+    bins = [[b, p, r, w] for b, (p, r, w) in sorted(profile.items())]
+    measured = _write(
+        tmp_path, "m.jsonl", json.dumps(_domains_row("Tanh", bins)) + "\n"
+    )
+    assert main(["domains", "--measured", measured]) == 0
+    assert (
+        "[{low: -.inf, high: -1, ulp: 1}, {low: -1, high: .inf, ulp: 9}]"
+        in capsys.readouterr().out
+    )
+
+
+def test_the_domains_view_draws_null_entries_as_the_emitter_does(tmp_path, capsys):
+    """A stray worse than every figure takes a figure of its own
+    (``ulp_domains.entries_of``), and a profile with no ranked binade draws no list."""
+    import json
+
+    strays = [[BINADE_OFFSET + k, 128, 128, 2] for k in range(10)]  # [1, 1024): 2 steps
+    strays.append([-BINADE_OFFSET, 128, 3, 40])  # [-2, -1): three lanes at 40
+    none = [[BINADE_OFFSET + k, 128, 3, 1] for k in range(10)]
+    rows = [_domains_row("Tanh", strays), _domains_row("Exp", none)]
+    measured = _write(tmp_path, "m.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
+    assert main(["domains", "--measured", measured]) == 0
+    out = capsys.readouterr().out
+    assert "{low: -.inf, high: 0, ulp: 40}, {low: 0, high: .inf, ulp: 2}" in out
+    assert "no list (no entry has a figure)" in out
+
+
+# ── Review round 2026-10-21 ──────────────────────────────────────────────────
+
+#: A row in the schema before the measurement became the gate: `max_ulp` held the gate,
+#: one step above the measurement under it.
+_LEGACY = f"{{in: Float16_b, out: Float16_b, max_ulp: 4, measured: 3, {_RUN}}}"
+
+
+@pytest.mark.parametrize(
+    "head_figure, kind",
+    [(3, "tightened"), (4, None), (5, "raised")],
+    ids=["headroom-dropped", "same-gate", "raised"],
+)
+def test_a_base_in_the_previous_schema_is_judged_by_the_gate_it_held(head_figure, kind):
+    """The base side still reads `max_ulp` beside `measured` (and `measured_all` on a
+    floored row), with `max_ulp` as its gate: the migration's own diff is then the
+    tightening it is, not an exit 2. The head is held to the current schema."""
+    base = parse_table(_head(_LEGACY), legacy=True)
+    head = parse_table(
+        _head(
+            f"{{in: Float16_b, out: Float16_b, {_LATER_RUN}, domains: [{{low: -.inf, "
+            f"high: .inf, ulp: {head_figure}}}]}}"
+        )
+    )
+    assert [c.kind for c in compare(base, head)] == ([kind] if kind else [])
+    floored = (
+        "{in: Float16_b, out: Float16_b, max_ulp: 2, near_zero_atol: 1.0e-07, "
+        f"measured: 2, measured_all: 9, {_RUN}}}"
+    )
+    assert parse_table(_head(floored), legacy=True)
+    with _refuses(ValueError) as caught:
+        parse_table(_head(_LEGACY))
+    assert "unknown field(s) ['max_ulp']" in str(caught.value)
+
+
+def test_diff_reads_a_previous_schema_base_and_a_current_head(tmp_path, capsys):
+    base = _write(tmp_path, "base.yaml", _head(_LEGACY))
+    head = _write(tmp_path, "head.yaml", _head(_LEGACY))
+    assert (
+        main(["diff", "--base", base, "--head", _write(tmp_path, "h.yaml", _BASE)]) == 0
+    )
+    assert "tightened" in capsys.readouterr().out
+    # The head side is not: a previous-schema head is a table the registry refuses.
+    assert main(["diff", "--base", base, "--head", head]) == 2
+
+
+def test_a_raise_in_a_large_negative_tail_is_seen():
+    """`-2**60 - 1.0 == -2**60`: probing the tail below an edge that far out landed on
+    the edge itself, which belongs to the next entry, and the raise read as no change.
+    """
+    from helpers.ulp_domains import number_text
+
+    edge = -(2**60)
+    row = (
+        '{in: Float32, out: Float32, dest: "No", run: 2026-10-20, domains: '
+        f"[{{low: -.inf, high: {edge}, ulp: TAIL}}, {{low: {edge}, high: .inf, ulp: 1}}]}}"
+    )
+    (change,) = compare(
+        _tanh(row.replace("TAIL", "1")),
+        _tanh(row.replace("TAIL", "2").replace("2026-10-20", "2026-10-21")),
+    )
+    assert (change.kind, change.segment) == (
+        "raised",
+        f"[-.inf, {number_text(float(edge))})",
+    )
+
+
+def test_a_widened_floor_beside_an_unchanged_list_is_a_regression():
+    """The floor rides beside the list and rescues lanes in every entry, so widening it
+    loosens every gated entry -- before a smaller figure can call the entry tightened.
+    """
+    floored = _TANH_LIST.replace("run:", "near_zero_atol: FLOOR, run:")
+    wider = floored.replace("FLOOR", "0.001").replace(
+        "high: .inf, ulp: 3", "high: .inf, ulp: 2"
+    )
+    kinds = _segment_kinds(_tanh(floored.replace("FLOOR", "1.0e-07")), _tanh(wider))
+    assert kinds == [
+        ("floor_widened", "[-.inf, -1)", "3 (floor 1e-07)", "3 (floor 0.001)"),
+        ("floor_widened", "[1, .inf)", "3 (floor 1e-07)", "2 (floor 0.001)"),
+    ]
+    assert all(
+        c.is_regression
+        for c in compare(_tanh(floored.replace("FLOOR", "1.0e-07")), _tanh(wider))
+    )
+
+
+def test_a_re_emit_that_splits_a_list_row_drops_no_baseline():
+    """As for a plain tolerance row: the query that leaves the split dimension unset
+    matches nothing after it, and no measured cell loses the figures its entries
+    record."""
+    ungated = _TANH_LIST.replace("ulp: 3}", "ulp: 9}")  # every entry past bf16's 6
+    one = ungated.replace('dest: "No", ', "")
+    split = "\n  - ".join(
+        ungated.replace('dest: "No"', f'dest: "{d}"').replace(
+            "2026-10-20", "2026-10-21"
+        )
+        for d in ("No", "Yes")
+    )
+    assert not [c for c in compare(_tanh(one), _tanh(split)) if c.is_regression]
+
+
+def _list_headroom(row, readings, empty=False):
+    """The headroom report on one Tanh list row and one cell's entry *readings*;
+    *empty* marks that cell as having ranked no lane."""
+    table = _tanh(row)
+    rows = [
+        {
+            "op": "Tanh",
+            "in": "Float16_b",
+            "out": "Float16_b",
+            "approx": "No",
+            "dest": "No",
+            "max": max(r[2] for r in readings) if readings else 0,
+            "lanes": sum(r[3] for r in readings),
+            "nonfinite": 0,
+            **({"domains": readings} if readings else {}),
+        }
+    ]
+    measured = _measured_cells(rows)
+    return render_headroom(
+        table,
+        measured,
+        empty=set(measured) if empty else (),
+        entries=_entry_readings(rows),
+    )
+
+
+@pytest.mark.parametrize(
+    "middle, verdict",
+    [(10, "regressed"), (3, "over budget")],
+    ids=["largest-past-the-ceiling", "largest-gated"],
+)
+def test_ranked_lanes_in_a_null_entry_are_held_to_the_largest_figure(middle, verdict):
+    """The sweep holds a null entry's few ranked lanes to the row's largest figure only
+    when it is within the ceiling; past it, only this report can, and it did not."""
+    row = _TANH_LIST.replace("ulp: 10", f"ulp: {middle}").replace(
+        "{low: 1, high: .inf, ulp: 3}", "{low: 1, high: .inf, ulp: null}"
+    )
+    report, regressions = _list_headroom(
+        row,
+        [["-inf", -1.0, 3, 16000], [-1.0, 1.0, middle, 33000], [1.0, "inf", 1000, 5]],
+    )
+    assert regressions == 1
+    assert f"x in [1, .inf)` | 1000 | {middle} | {verdict} |" in report
+    report, regressions = _list_headroom(
+        row, [["-inf", -1.0, 3, 16000], [-1.0, 1.0, middle, 33000], [1.0, "inf", 2, 5]]
+    )
+    assert regressions == 0
+
+
+def test_an_ungated_list_cell_that_lost_every_lane_is_a_regression():
+    """Every entry past the ceiling: the sweep records the cell without readings and
+    skips it, and the headroom report counted it unjudged and passed."""
+    ungated = _TANH_LIST.replace("ulp: 3}", "ulp: 9}")
+    report, regressions = _list_headroom(ungated, [], empty=True)
+    assert regressions == 1
+    assert "| 0 | 10 | no lane measurable |" in report

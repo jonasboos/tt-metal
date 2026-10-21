@@ -36,8 +36,6 @@ from helpers.sfpu_accuracy_budget import (
     _SFPU_ACCURACY_BUDGET,
     _TABLE_PATH,
     DEFAULT,
-    EXACT_BY_CONSTRUCTION_OPS,
-    EXACT_IN_EVERY_FORMAT_OPS,
     MEASURED_ARCH,
     TOLERANCE_CONTRACT,
     AccuracyContract,
@@ -1720,39 +1718,6 @@ def test_the_provenance_parser_sees_every_budget_the_registry_enforces():
     assert parsed == loaded
 
 
-#: Exact by construction without being canaries: a clamp returns one of its operands,
-#: and x - trunc(x) is exact, so a sampled 0 on these states what the op guarantees
-#: rather than what the sample happened to miss -- where the output can hold that
-#: operand. SfpuBinaryMax/Min are selections too, and already
-#: canaries in ``EXACT_ZERO_BY_CONSTRUCTION``.
-EXACT_SELECTIONS = (
-    MathOperation.ReluMax,
-    MathOperation.ReluMin,
-    MathOperation.UnaryMax,
-    MathOperation.UnaryMin,
-    MathOperation.Frac,
-)
-
-
-def test_the_emitter_and_the_guards_agree_on_which_ops_are_exact_in_every_format():
-    """The emitter keeps a strided 0 on a cell that rounds at pack only for these; the
-    guards below judge by EXACT_IN_EVERY_FORMAT, derived from the finer lists."""
-    assert set(EXACT_IN_EVERY_FORMAT) == EXACT_IN_EVERY_FORMAT_OPS, sorted(
-        op.name for op in set(EXACT_IN_EVERY_FORMAT) ^ EXACT_IN_EVERY_FORMAT_OPS
-    )
-
-
-def test_the_emitter_and_the_guards_agree_on_which_ops_are_exact():
-    """The emitter keeps a strided 0 only on EXACT_BY_CONSTRUCTION_OPS, and the guards
-    here judge by their own finer lists; an op in one and not the other would be
-    floored by one and held to 0 by the other."""
-
-    listed = {*EXACT_BY_CONSTRUCTION, *EXACT_ZERO_BY_CONSTRUCTION, *EXACT_SELECTIONS}
-    assert listed == EXACT_BY_CONSTRUCTION_OPS, sorted(
-        op.name for op in listed ^ EXACT_BY_CONSTRUCTION_OPS
-    )
-
-
 def test_a_demoted_row_measured_past_the_ceiling():
     """A tolerance row the sweep measured on a step-gateable output is a demotion only
     if its ``measured`` is past ``usable_budget_ceiling`` -- ``_verdict``'s call for that
@@ -1958,11 +1923,10 @@ def _not_measurable_cells(path=_TABLE_PATH):
     return cells
 
 
-#: The repo's `check-large-files` pre-commit hook (scripts/check_file_size.py): a file of
-#: more than this many KB, rounded up, fails it, and the table has no exclude there.
-#: The table's own ceiling. The repo's check-large-files hook (500 KB) excludes the
-#: table since every row the sweep writes carries its `domains` list, which took it past
-#: that; this is the limit that replaces the hook's for the one file.
+#: The table's own ceiling. Both 500 KB size hooks -- the repo root's `check-large-files`
+#: (scripts/check_file_size.py, which CI runs) and tt-llk's `check-added-large-files` --
+#: exclude the table since every row the sweep writes carries its `domains` list, which
+#: took it past that; this is the limit that replaces theirs for the one file.
 _TABLE_SIZE_LIMIT_KB = 1024
 
 
@@ -1975,6 +1939,37 @@ def test_the_table_fits_its_own_size_limit():
     assert (
         kb <= _TABLE_SIZE_LIMIT_KB
     ), f"{_TABLE_PATH.name} is {kb} KB, past its {_TABLE_SIZE_LIMIT_KB} KB limit"
+
+
+@pytest.mark.parametrize(
+    "levels_up, hook",
+    [(5, "check-large-files"), (3, "check-added-large-files")],
+    ids=["repo-root", "tt-llk"],
+)
+def test_the_size_hooks_leave_the_table_to_its_own_limit(levels_up, hook):
+    """Both 500 KB hooks must exclude the table, or every change to it fails
+    pre-commit. Only tt-llk's did once, and CI runs the repo root's. An exclude is
+    matched against the path from the config's own directory."""
+    import re
+
+    import yaml
+
+    base = _TABLE_PATH.parents[levels_up]
+    config = base / ".pre-commit-config.yaml"
+    if not config.exists():
+        pytest.skip(f"no {config} in this checkout")
+    hooks = [
+        h
+        for repo in yaml.safe_load(config.read_text(encoding="utf-8"))["repos"]
+        for h in repo.get("hooks", [])
+        if h["id"] == hook
+    ]
+    assert hooks, f"{config}: no `{hook}` hook"
+    path = _TABLE_PATH.relative_to(base).as_posix()
+    for h in hooks:
+        assert re.search(
+            h.get("exclude", "(?!)"), path
+        ), f"{config}: `{hook}` does not exclude {path}"
 
 
 #: Rows whose every claimed lane disagreed with the golden about being finite: there

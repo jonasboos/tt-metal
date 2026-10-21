@@ -50,110 +50,19 @@ from .ulp import (  # FLUSH_SUBNORMAL_OUTPUTS re-exported: the step gates read i
     has_ulp_gate,
     ulp_dtype,
 )
-from .ulp_domains import DOMAINS_FIELD, Domain, check_domains, contract_of
+from .ulp_domains import (
+    DOMAINS_FIELD,
+    LIST_OUTPUTS,
+    NOT_BESIDE_DOMAINS,
+    Domain,
+    check_domains,
+    contract_of,
+)
 from .ulp_provenance import PROVENANCE_FIELDS, check_provenance, load_yaml
 
 #: The architecture every unkeyed budget was measured on. Anywhere else an op resolves
 #: to the tolerance metric until the sweep has been re-run there.
 MEASURED_ARCH = ChipArchitecture.WORMHOLE
-
-#: Ops exact by construction: a sign-bit change, a copy, an integer, a predicate's
-#: 1.0/0.0, a constant, a selection or a clamp. A measured 0 on one of these states what
-#: the op guarantees. test_sfpu_accuracy_budget.py's finer-grained lists
-#: (EXACT_BY_CONSTRUCTION, EXACT_ZERO_BY_CONSTRUCTION, EXACT_SELECTIONS) must cover
-#: exactly this set.
-EXACT_BY_CONSTRUCTION_OPS = frozenset(
-    {
-        MathOperation.Abs,
-        MathOperation.Neg,
-        MathOperation.Identity,
-        MathOperation.Floor,
-        MathOperation.Ceil,
-        MathOperation.Trunc,
-        MathOperation.Round,
-        MathOperation.Fill,
-        MathOperation.Threshold,
-        MathOperation.Clamp,
-        MathOperation.Hardtanh,
-        MathOperation.Isfinite,
-        MathOperation.Isinf,
-        MathOperation.Isnan,
-        MathOperation.Isneginf,
-        MathOperation.Isposinf,
-        MathOperation.LogicalNot,
-        MathOperation.Signbit,
-        MathOperation.Sign,
-        MathOperation.Heaviside,
-        MathOperation.EqualZero,
-        MathOperation.NotEqualZero,
-        MathOperation.LessThanZero,
-        MathOperation.GreaterThanZero,
-        MathOperation.LessThanEqualZero,
-        MathOperation.GreaterThanEqualZero,
-        MathOperation.UnaryEq,
-        MathOperation.UnaryNe,
-        MathOperation.UnaryGt,
-        MathOperation.UnaryGe,
-        MathOperation.UnaryLt,
-        MathOperation.UnaryLe,
-        MathOperation.SfpuElwEq,
-        MathOperation.SfpuElwNe,
-        MathOperation.SfpuElwGt,
-        MathOperation.SfpuElwGe,
-        MathOperation.SfpuElwLt,
-        MathOperation.SfpuElwLe,
-        MathOperation.SfpuIsclose,
-        MathOperation.SfpuMask,
-        MathOperation.SfpuAddTopRow,
-        MathOperation.ReluMax,
-        MathOperation.ReluMin,
-        MathOperation.UnaryMax,
-        MathOperation.UnaryMin,
-        MathOperation.Frac,
-        MathOperation.SfpuBinaryMax,
-        MathOperation.SfpuBinaryMin,
-    }
-)
-
-#: The subset of EXACT_BY_CONSTRUCTION_OPS whose every result is exact in every format --
-#: a predicate's 1.0/0.0, a sign, or a constant -- so not even a cell whose output is
-#: narrower than its input has anything for the pack to round. Every other exact op
-#: returns an operand or an integer, which the pack rounds where the output cannot hold
-#: it (Abs, Neg and Identity's 1-step Float32 -> Float16_b cells).
-#: test_sfpu_accuracy_budget.py's EXACT_IN_EVERY_FORMAT must be exactly this set.
-EXACT_IN_EVERY_FORMAT_OPS = frozenset(
-    {
-        MathOperation.EqualZero,
-        MathOperation.Fill,
-        MathOperation.GreaterThanEqualZero,
-        MathOperation.GreaterThanZero,
-        MathOperation.Heaviside,
-        MathOperation.Isfinite,
-        MathOperation.Isinf,
-        MathOperation.Isnan,
-        MathOperation.Isneginf,
-        MathOperation.Isposinf,
-        MathOperation.LessThanEqualZero,
-        MathOperation.LessThanZero,
-        MathOperation.LogicalNot,
-        MathOperation.NotEqualZero,
-        MathOperation.SfpuElwEq,
-        MathOperation.SfpuElwGe,
-        MathOperation.SfpuElwGt,
-        MathOperation.SfpuElwLe,
-        MathOperation.SfpuElwLt,
-        MathOperation.SfpuElwNe,
-        MathOperation.SfpuIsclose,
-        MathOperation.Sign,
-        MathOperation.Signbit,
-        MathOperation.UnaryEq,
-        MathOperation.UnaryGe,
-        MathOperation.UnaryGt,
-        MathOperation.UnaryLe,
-        MathOperation.UnaryLt,
-        MathOperation.UnaryNe,
-    }
-)
 
 #: The variant :func:`accuracy_contract` was last asked about and nothing has consumed
 #: yet, as ``(test_id, op, input_format, output_format, approx_mode, dest_acc, arch)``.
@@ -406,19 +315,6 @@ _KEY_FIELDS: Dict[str, str] = {
 #: ``domains`` list, derived from the list (:func:`_list_contract`).
 _CONTRACT_FIELDS = frozenset({"metric", "near_zero_atol", "atol", "rtol"})
 
-#: Fields that do not belong beside a ``domains`` list: the list is the whole statement
-#: of what was measured and what gates, so a cell-level figure, metric or sample date
-#: beside it would be a second statement to drift from the first.
-_NOT_BESIDE_DOMAINS = (
-    "measured",
-    "metric",
-    "max_ulp",
-    "sampled",
-    "atol",
-    "rtol",
-    "nonfinite",
-)
-
 
 def usable_budget_ceiling(output_format: DataFormat) -> float:
     """The largest budget that is still *stronger* than the gate it replaces.
@@ -450,7 +346,7 @@ def _list_contract(where: str, row: Dict[str, Any]) -> AccuracyContract:
     """A row with a ``domains`` list as the contract it implies (``ulp_domains``). The
     row pins the formats it was measured on and names its run; the metric and the
     whole-cell figure come from the entries."""
-    for field in _NOT_BESIDE_DOMAINS:
+    for field in NOT_BESIDE_DOMAINS:
         if field in row:
             raise ValueError(
                 f"{where}: `{field}` does not belong beside `{DOMAINS_FIELD}`; the list "
@@ -467,7 +363,7 @@ def _list_contract(where: str, row: Dict[str, Any]) -> AccuracyContract:
         )
     check_provenance(where, row, tolerance=True)  # the date's own checks
     out_fmt = _enum_member(DataFormat, row["out"], where)
-    if not has_ulp_gate(out_fmt) or out_fmt in _ULP_PROXY_DTYPES:
+    if out_fmt.name not in LIST_OUTPUTS:
         raise ValueError(
             f"{where}: {out_fmt.name} has no per-element ULP, so no `{DOMAINS_FIELD}`"
         )

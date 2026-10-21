@@ -28,7 +28,7 @@ import torch
 import yaml
 from helpers.format_config import DataFormat
 from helpers.stimuli_generator import StimuliSpec
-from helpers.ulp_domains import BINADE_OFFSET, DOMAINS_FIELD, Bin, Domain
+from helpers.ulp_domains import BINADE_OFFSET, DOMAINS_FIELD, Bin, Domain, entries_of
 from helpers.ulp_provenance import (
     PROVENANCE_FIELDS,
     BudgetTable,
@@ -66,8 +66,8 @@ _STIMULI_FORMAT: Dict[DataFormat, DataFormat] = {
 #: Float32 has 2**32 values and one run holds 2**16, so it is the one input the sweep
 #: samples rather than enumerates. Striding the total order gives every binade an equal
 #: share (each holds the same number of values); a consecutive walk of one run's 2**16
-#: would cover 1/128 of one binade's 2**23. One sample per bfloat16 cell, 65,280 of
-#: them, but not at the cell's start: the walk starts on -inf, a multiple of 2**16, so
+#: would cover 1/128 of one binade's 2**23. One sample per normal bfloat16 cell, 65,024
+#: of them, but not at the cell's start: the walk starts on -inf, a multiple of 2**16, so
 #: every sample would be a bfloat16 value -- the Float16_b sweep again -- and an fp32
 #: path that reads the low 16 mantissa bits (a LUT index, a truncating convert) would go
 #: untested. The walk moves each sample along its cell by 1/phi of a cell from the one
@@ -403,8 +403,8 @@ def measurable_mask(
     Op-agnostic on purpose: an op undefined at an input lands in the NaN kind on its
     own, so there is nothing per-op to look up.
 
-    The sweep feeds every non-special value of the format, with no per-op domain
-    clipping -- an op is measured wherever its format can reach. Five lane kinds come
+    The sweep feeds every normal value of the format and its zero (a stride of them for
+    Float32), with no per-op domain clipping -- an op is measured wherever its format can reach. Five lane kinds come
     back out, none of them a budget question (the fourth is two, on one boundary):
 
     * either side NaN. :func:`ulp_distance` returns ``UNMEASURABLE`` there, and an op
@@ -927,9 +927,7 @@ def nonfinite_failures(
 
 #: How many offending lanes a non-finite verdict spells out. Two: the verdict is written
 #: on each of the table's ~400 not-measurable rows, and at four the named lanes were a
-#: tenth of the file and took it past the repo's 500 KB `check-large-files` limit
-#: (test_the_table_fits_the_repos_file_size_limit). The count beside them says how many
-#: there are; two show the kind.
+#: tenth of the file. The count beside them says how many there are; two show the kind.
 NAMED_LANES = 2
 
 
@@ -1112,35 +1110,38 @@ def floored_distance(distance: torch.Tensor, covered: torch.Tensor) -> torch.Ten
 
 
 def _binade_index(x: torch.Tensor) -> torch.Tensor:
-    """``ulp_domains.binade`` over a tensor of received inputs."""
+    """``ulp_domains.binade`` over a tensor of received inputs: a negative power of two
+    is the low edge of the binade above it."""
     flat = x.reshape(-1).to(torch.float64)
-    _, exponent = torch.frexp(flat)
-    index = exponent.to(torch.int64) - 1 + BINADE_OFFSET
+    mantissa, exponent = torch.frexp(flat)
+    k = exponent.to(torch.int64) - 1 - ((flat < 0) & (mantissa.abs() == 0.5)).long()
+    index = k + BINADE_OFFSET
     return torch.where(
         flat > 0, index, torch.where(flat < 0, -index, torch.zeros_like(index))
     )
 
 
 def binade_maxima(
-    x: torch.Tensor, distance: torch.Tensor, judged: torch.Tensor, present: torch.Tensor
+    x: torch.Tensor, distance: torch.Tensor, ranked: torch.Tensor, present: torch.Tensor
 ) -> Dict[int, Bin]:
     """Per signed binade of the received input *x*: lanes *present* (data, not
-    padding), lanes *judged* (ranked, outside the floor) and the worst judged lane --
-    the profile ``ulp_domains.partition`` draws a cell's list on, and what
-    ``--ulp-measure`` records as ``bins``."""
+    padding), lanes *ranked* and the worst of them by *distance* -- the profile
+    ``ulp_domains.partition`` draws a cell's list on, and what ``--ulp-measure``
+    records as ``bins``. Both callers pass the floor-covered lanes as ranked at 0 steps
+    (:func:`floored_distance`)."""
     index = _binade_index(x)
     dist = distance.reshape(-1).to(torch.int64)
     present = present.reshape(-1)
-    judged = judged.reshape(-1)
+    ranked = ranked.reshape(-1)
     bins: Dict[int, Bin] = {}
     for b in torch.unique(index[present]).tolist():
         here = index == b
-        ranked = here & judged
-        n = int(ranked.sum())
+        lanes = here & ranked
+        n = int(lanes.sum())
         bins[int(b)] = (
             int((here & present).sum()),
             n,
-            int(dist[ranked].max()) if n else -1,
+            int(dist[lanes].max()) if n else -1,
         )
     return bins
 
@@ -1174,16 +1175,18 @@ def domain_figures(
     judged: torch.Tensor,
 ) -> Tuple[Domain, ...]:
     """Each ``(low, high, ranked)`` of ``ulp_domains.partition`` as the entry the table
-    writes: the worst *judged* lane in it (ranked, outside the floor), 0 where the floor
-    covers every ranked lane, ``None`` where the span is unranked. Measured over the
-    final edges rather than summed from the binades, so the figure written is exactly
-    what the gate will hold the same lanes to."""
-    out = []
-    for low, high, ranked in spans:
-        entry = Domain(low, high, None)
-        figure = _figure(entry, x, distance, mask, judged)[0] if ranked else None
-        out.append(Domain(low, high, figure))
-    return tuple(out)
+    writes (``ulp_domains.entries_of``): the worst *judged* lane in it (ranked, outside
+    the floor), 0 where the floor covers every ranked lane, ``None`` where the span is
+    unranked and its stray ranked lanes fit the row's largest figure; ``()`` when no
+    span measured anything. Measured over the final edges rather than summed from the
+    binades, so the figure written is exactly what the gate will hold the same lanes
+    to."""
+    return entries_of(
+        spans,
+        lambda low, high: _figure(Domain(low, high, None), x, distance, mask, judged)[
+            0
+        ],
+    )
 
 
 def entry_readings(

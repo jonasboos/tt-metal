@@ -63,8 +63,8 @@ is the format's.
 
 | format | as input | as output | how |
 |---|---|---|---|
-| `Float16_b` | yes | yes | all 65,025 normal values, and zero |
-| `Float16` | yes | yes | all 61,441 normal values, and zero |
+| `Float16_b` | yes | yes | all 65,025 values: every normal one, and zero |
+| `Float16` | yes | yes | all 61,441 values: every normal one, and zero |
 | `Bfp8_b` | yes | yes | swept in bfloat16, packed on the way in |
 | `Bfp4_b` | yes | **no** | swept in bfloat16, packed on the way in |
 | `Float32` | yes | yes | **strided**, not exhaustive — see below |
@@ -127,8 +127,8 @@ keeps only the lanes the op *claims* (below):
   #54770 answers -1 or -131008 where the golden is 131008. Only where the Dest
   is narrower than the output; under an fp16 output the two overflow together and that
   is judged as an output overflow;
-- **the sweep's own zero padding** — the tensor is 65,536 lanes and bfloat16 has 65,025
-  normal values and zero, so the last 511 are padding rather than data.
+- **the sweep's own zero padding** — the tensor is 65,536 lanes and the bfloat16 sweep feeds
+  65,025 values (every normal one, and zero), so the last 511 are padding rather than data.
 
 The second kind is a *failure*, not a non-question: it is dropped from the ranking only
 because `nonfinite_failures` reports it, over the same claimed lanes.
@@ -216,7 +216,8 @@ no headroom over it. The comment is for people. Five verdicts:
   exactly `U` steps, a reading one step worse fails it, and a re-emit that records the
   worse figure is a raised gate the PR guard reports. An entry past the ceiling is
   measured, not gated, and the headroom report holds it to its figure. `ulp: null` is
-  an entry where no lane is ranked. A one-domain op gets a one-entry list, so every
+  an entry with too few ranked lanes to draw an edge on, none of them worse than the
+  row's largest figure. A one-domain op gets a one-entry list, so every
   such row reads the same way. A measured 0 stays 0, on the strided `Float32` input
   too: the stride is a fixed set of values, and the figure is a measurement of it.
 - **`near_zero_atol: A`** beside the list — a floor: the step count is a difference of
@@ -226,8 +227,8 @@ no headroom over it. The comment is for people. Five verdicts:
   instead; `A` is exactly the largest absolute error among the band lanes past the
   ceiling, written as measured, and every entry's figure is over the lanes outside it.
   The emitter grants a floor up to `ulp_sweep.EMIT_MAX_NEAR_ZERO_ATOL` (1e-3); a cell
-  that would need more keeps its list without one, and the entries show where it falls
-  past the ceiling.
+  that would need more keeps its list with the floor capped there, and the entries show
+  where it still falls past the ceiling.
 - **`measured: N`**, no `metric` — a row a functional driver sampled (the binary,
   ternary and scalar ops, and the hand-built unary sweeps). The driver holds the cell to
   exactly `N` steps.
@@ -349,9 +350,13 @@ from 0 up. `abs` is exact over the whole range.
   received it* (`ulp_sweep.received_inputs`: block-quantized for `Bfp8_b`/`Bfp4_b`,
   truncated to the 16-bit Dest for a `Float32` input at `dest: "No"`), satisfies
   `L <= x < H`. `U` is the worst ranked lane there, outside the row's near-zero floor
-  if it has one; `null` means no lane there is ranked: past the op's claim (`cos`
+  if it has one; `null` means too few lanes there are ranked to draw an edge on (fewer
+  than `DOMAIN_MIN_BIN_LANES` in each of its binades): past the op's claim (`cos`
   beyond 65504), undefined (`log` below 0, every value below -128 for `lgamma`), or an
-  answer the Dest cannot hold. Which lanes an op claims stays in code
+  answer the Dest cannot hold. The few ranked lanes a `null` entry can still hold are
+  gated at the row's largest figure, so the emitter writes `null` only while they fit
+  it; otherwise the entry whose strays are worst carries its own figure. A cell where
+  no entry would carry a figure gets a plain row, not a list. Which lanes an op claims stays in code
   (`_CLAIM_LIMIT`, `_OP_SINGULARITIES`, `_NONPOSITIVE_INTEGER_POLES`); the list reports
   it.
 - **Gated or not follows the figure.** An entry within `usable_budget_ceiling` of the
@@ -365,8 +370,9 @@ from 0 up. `abs` is exact over the whole range.
   of two, written in its shortest exact form (`0.00390625`, `65536`,
   `8.507059173023462e+37`).
 - **The emitter draws it** from the sweep's per-lane distances (`ulp_domains`): the
-  worst ranked lane per signed binade of the received input, split where it crosses the
-  ceiling (`DOMAIN_CLASS_BITS` would split the gateable range into step classes as
+  worst ranked lane per signed binade of the received input (`[2^k, 2^(k+1))`, or
+  `[-2^(k+1), -2^k)`, so -1 opens `[-1, -0.5)` and no binade straddles an edge), split
+  where it crosses the ceiling (`DOMAIN_CLASS_BITS` would split the gateable range into step classes as
   well; the binary rule is the question asked, and factor-2 classes gave eight times
   the entries for the pack path's 0-vs-1 flicker between binades), a binade with fewer
   than `DOMAIN_MIN_BIN_LANES` lanes folded into its neighbour, a gateable domain under
@@ -378,9 +384,10 @@ from 0 up. `abs` is exact over the whole range.
   then measured over exactly its lanes outside the floor, so what is written is what
   the gate holds them to.
 - **The sweep gates entry by entry.** Each gateable entry's lanes are held to its
-  figure with the row's floor; the ranked lanes a `null` entry leaves (a stray lane in
-  an otherwise unranked binade) are held to the row's largest figure, so no ranked lane
-  goes unjudged. A failure names the entry.
+  figure with the row's floor; the ranked lanes a `null` entry leaves (strays in
+  otherwise unranked binades) are held to the row's largest figure, so no ranked lane
+  goes unjudged. A failure names the entry. Where that figure is past the ceiling the
+  sweep gates no fallback, and the headroom report holds those lanes to it instead.
 - **The headroom report judges entry by entry too**: the `--ulp-measure` row carries
   the reading over each entry of the table's list (`domains`) and the per-binade profile
   it was drawn from (`bins`), and `python3 helpers/ulp_budget_diff.py domains --measured

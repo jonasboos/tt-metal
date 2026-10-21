@@ -1165,8 +1165,8 @@ def test_the_sweep_tile_count_holds_every_swept_value():
 
 #: The Float32 walk's sample count, written down independently of the code that makes
 #: it: one sample per normal bfloat16 bit pattern, 2**16 less the 256 inf/NaN cells and
-#: the 256 subnormal ones, which the sweep does not feed. (65,025 distinct normal bf16
-#: *values* and zero: -0.0 and +0.0 are two cells but one value.)
+#: the 256 subnormal ones, which the sweep does not feed. (65,025 distinct bf16 *values*,
+#: zero included: -0.0 and +0.0 are two cells but one value.)
 _FLOAT32_WALK_SAMPLES = 65024
 
 
@@ -2035,19 +2035,19 @@ def test_the_tensor_side_draws_the_rule_on_the_lanes_and_measures_each_entry(
     monkeypatch.setattr(rule, "DOMAIN_MIN_BIN_LANES", 1)
     monkeypatch.setattr(rule, "DOMAIN_MIN_LANES", 1)
     x = torch.tensor(
-        [-3.0, -2.5, -1.5, -1.0, 0.5, 0.75, 1.5, 2.0, 3.0, 6.0], dtype=torch.float64
+        [-3.0, -2.5, -1.5, -1.25, 0.5, 0.75, 1.5, 2.0, 3.0, 6.0], dtype=torch.float64
     )
     distance = torch.tensor([1, 2, 1, 1, 0, 0, 9, 8, 1, 1])
     judged = torch.ones(10, dtype=torch.bool)
-    judged[3] = False  # -1.0 is not ranked
+    judged[3] = False  # -1.25 is not ranked
     present = torch.ones(10, dtype=torch.bool)
     bins = binade_maxima(x, distance, judged, present)
     assert bins[rule.binade(-3.0)] == (2, 2, 2) and bins[rule.binade(1.5)] == (1, 1, 9)
-    assert bins[rule.binade(-1.0)] == (
+    assert bins[rule.binade(-1.25)] == (
         2,
         1,
         1,
-    )  # -1.5 shares the binade; -1.0 is unranked
+    )  # -1.5 shares the binade; -1.25 is unranked
     spans = rule.partition(bins, 6.0)
     # 1.5 (9 steps) and 2.0 (8 steps) are both past bf16's ceiling of 6: one bad range.
     assert spans == ((-_INF, 1.0, True), (1.0, 4.0, True), (4.0, _INF, True))
@@ -2069,3 +2069,78 @@ def test_the_tensor_side_draws_the_rule_on_the_lanes_and_measures_each_entry(
     assert not floor_covered(
         golden, result, torch.ones(3, dtype=torch.bool), None
     ).any()
+
+
+def test_the_tensor_binade_is_the_scalar_one():
+    """`binade_maxima` indexes lanes with `_binade_index`; the list's edges come from
+    `ulp_domains.binade`. A negative power of two is where they could part: it is the
+    low edge of the binade above it."""
+    import helpers.ulp_domains as rule
+    from helpers.ulp_sweep import _binade_index
+
+    values = [0.0, 2.0**-149, -(2.0**-149), 2.0**-126, -(2.0**-126), -0.5, -0.75]
+    values += [-1.0, -1.5, -2.0, 1.0, 1.5, 2.0, 65504.0, -65504.0, -(2.0**127)]
+    x = torch.tensor(values, dtype=torch.float64)
+    assert _binade_index(x).tolist() == [rule.binade(v) for v in values]
+
+
+def test_a_worst_lane_on_a_negative_edge_is_figured_on_the_side_its_entry_holds(
+    tmp_path, capsys
+):
+    """-1 belongs to the entry that opens at -1, and its binade is that entry's. When it
+    shared (-2, -1]'s, its 9 steps classed that binade past the ceiling, and the
+    offline view, which figures an entry from its binades, read the entry below -1 as
+    9 where the emitter measures 1. The two now draw the same list."""
+    import json
+
+    import helpers.ulp_domains as rule
+    from helpers.ulp_budget_diff import main
+    from helpers.ulp_sweep import binade_maxima, domain_figures
+
+    n = 2048  # each run of lanes is a domain of its own at DOMAIN_MIN_LANES
+    x = torch.tensor([-1.5] * n + [-1.0] * n + [-0.75] * n, dtype=torch.float64)
+    distance = torch.tensor([1] * n + [9] * n + [9] * n)
+    every = torch.ones(3 * n, dtype=torch.bool)
+    bins = binade_maxima(x, distance, every, every)
+    drawn = domain_figures(rule.partition(bins, 6.0), x, distance, every, every)
+    assert drawn == (Domain(-_INF, -1, 1), Domain(-1, _INF, 9))
+    row = {
+        "op": "Tanh",
+        "in": "Float16_b",
+        "out": "Float16_b",
+        "approx": "No",
+        "dest": "No",
+        "max": 9,
+        "lanes": 3 * n,
+        "nonfinite": 0,
+        "bins": [[b, *v] for b, v in sorted(bins.items())],
+    }
+    measured = tmp_path / "m.jsonl"
+    measured.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert main(["domains", "--measured", str(measured)]) == 0
+    assert rule.domains_text(drawn) in capsys.readouterr().out
+
+
+def test_a_cell_whose_strays_beat_every_figure_writes_a_list_its_gate_passes(
+    monkeypatch,
+):
+    """A null entry's few ranked lanes are held to the row's largest figure, so one
+    worse than every figure takes a figure of its own; and with no ranked span at all
+    the cell gets no list rather than one the registry refuses."""
+    import helpers.ulp_domains as rule
+    from helpers.ulp_sweep import binade_maxima, domain_figures
+
+    monkeypatch.setattr(rule, "DOMAIN_MIN_LANES", 1)
+    good = [1.0 + i / 64 for i in range(64)]  # [1, 2): 64 ranked lanes at 1 step
+    x = torch.tensor([-1.5] * 64 + good, dtype=torch.float64)
+    distance = torch.tensor([30] * 64 + [1] * 64)
+    ranked = torch.tensor([i < 3 for i in range(64)] + [True] * 64)  # 3 strays at 30
+    present = torch.ones(128, dtype=torch.bool)
+    bins = binade_maxima(x, distance, ranked, present)
+    spans = rule.partition(bins, 6.0)
+    assert [r for _, _, r in spans] == [False, True]
+    drawn = domain_figures(spans, x, distance, present, ranked)
+    assert [d.ulp for d in drawn] == [30, 1]
+    few = torch.tensor([i < 3 for i in range(128)])
+    nothing = rule.partition(binade_maxima(x, distance, few, present), 6.0)
+    assert domain_figures(nothing, x, distance, present, few) == ()

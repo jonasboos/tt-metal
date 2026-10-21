@@ -62,6 +62,9 @@ repos:
       entry: python3 scripts/check_file_size.py
       language: system
       types: [file]
+      # The SFPU accuracy table: its own 1024 KB limit is held by a host test
+      # (tt_metal/tt-llk/tests/SFPU_ULP.md).
+      exclude: ^tt_metal/tt-llk/tests/python_tests/helpers/sfpu_accuracy_budget\.yaml$
     - id: validate-metalium-api
       name: validate-metalium-api
       entry: python3 scripts/validate_api/validate_api.py tt_metal/api

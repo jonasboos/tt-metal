@@ -17,12 +17,14 @@ from helpers.ulp_domains import (
     CEILINGS,
     DOMAIN_MIN_BIN_LANES,
     DOMAIN_MIN_LANES,
+    LIST_OUTPUTS,
     Domain,
     binade,
     binade_edges,
     check_domains,
     contract_of,
     domains_text,
+    entries_of,
     number_text,
     partition,
 )
@@ -59,8 +61,20 @@ def test_binades_order_as_the_values_do():
     assert binade_edges(binade(0.3)) == (0.25, 0.5)
     assert binade_edges(binade(-0.3)) == (-0.5, -0.25)
     assert binade_edges(binade(1.0)) == (1.0, 2.0)
-    assert binade(2.0**-126) == -126 + BINADE_OFFSET == 24  # bf16's smallest normal
+    assert binade(2.0**-126) == -126 + BINADE_OFFSET == 25  # bf16's smallest normal
     assert binade_edges(0) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    "x", [-2.0, -1.5, -1.0, -0.75, -0.5, -(2.0**-149), 2.0**-149, 0.5, 1.0, 1.5, 2.0]
+)
+def test_a_binade_holds_its_lanes_as_an_entry_does(x):
+    """``low <= x < high`` on both sides: -1 opens [-1, -0.5), as it opens an entry that
+    starts at -1, so no binade's lanes straddle an entry's edge. The smallest subnormal
+    still gets a binade of its own, apart from zero's."""
+    low, high = binade_edges(binade(x))
+    assert low <= x < high
+    assert binade(x) != 0
 
 
 def test_a_flat_profile_is_one_entry_over_the_whole_range():
@@ -97,7 +111,7 @@ def test_a_stray_ranked_lane_in_an_unranked_binade_is_noise():
     def profile():
         bins = _profile(lambda k, s: 4 if k < 0 else None)
         for sign in (1, -1):
-            bins[sign * BINADE_OFFSET] = (128, 1, 0)  # [1, 2) and (-2, -1]: one lane
+            bins[sign * BINADE_OFFSET] = (128, 1, 0)  # [1, 2) and [-2, -1): one lane
         return bins
 
     assert partition(profile(), BF16) == (
@@ -138,6 +152,67 @@ def test_the_profile_of_a_strided_float32_input_partitions_the_same_way():
         (-(2.0**21), 2.0**21, True),
         (2.0**21, INF, True),
     )
+
+
+def test_a_finer_step_class_splits_the_gateable_range(monkeypatch):
+    """``DOMAIN_CLASS_BITS``: with 1, classes a factor of 2 apart (0 and 1 together)
+    split the gateable range as well; a narrow class still folds into a looser
+    neighbour."""
+    import helpers.ulp_domains as ulp_domains
+
+    monkeypatch.setattr(ulp_domains, "DOMAIN_CLASS_BITS", 1)
+    lanes = 1024  # one binade per side is a domain of its own at DOMAIN_MIN_LANES
+    spans = partition(_profile(lambda k, s: 4 if s > 0 else 1, lanes=lanes), BF16)
+    assert spans == ((-INF, 0.0, True), (0.0, INF, True))
+    narrow = partition(
+        _profile(lambda k, s: 1 if (k, s) == (3, 1) else 4, lanes=128), BF16
+    )
+    assert narrow == ((-INF, INF, True),)
+
+
+def _worst_of(figures):
+    """*worst(low, high)* over a dict of ``(low, high) -> worst``."""
+    return lambda low, high: figures.get((low, high))
+
+
+def test_a_null_span_keeps_null_while_its_strays_fit_the_largest_figure():
+    spans = ((-INF, 0.0, False), (0.0, 1.0, True), (1.0, INF, True))
+    figures = {(-INF, 0.0): 2, (0.0, 1.0): 3, (1.0, INF): 1}
+    assert entries_of(spans, _worst_of(figures)) == (
+        Domain(-INF, 0, None),
+        Domain(0, 1, 3),
+        Domain(1, INF, 1),
+    )
+
+
+def test_the_null_span_whose_strays_are_worst_takes_a_figure():
+    """The sweep holds a null entry's ranked lanes to the row's largest figure, so a
+    list whose strays exceed it would fail the next run on identical output. Only the
+    worst such span needs a figure: the others then fit the new largest."""
+    spans = ((-INF, -1.0, False), (-1.0, 0.0, False), (0.0, INF, True))
+    figures = {(-INF, -1.0): 40, (-1.0, 0.0): 1000, (0.0, INF): 3}
+    assert entries_of(spans, _worst_of(figures)) == (
+        Domain(-INF, -1, None),
+        Domain(-1, 0, 1000),
+        Domain(0, INF, 3),
+    )
+
+
+def test_spans_with_no_figure_draw_no_list():
+    """Every binade ranks a few lanes: no span is ranked, and a list with no figure is
+    one ``check_domains`` refuses when the registry loads. The cell gets a plain row."""
+    assert entries_of(((-INF, INF, False),), lambda low, high: 1000) == ()
+    assert entries_of(((-INF, 0.0, True), (0.0, INF, False)), lambda lo, hi: None) == ()
+
+
+def test_the_list_outputs_are_the_registrys():
+    """The outputs with a per-element ULP, which this module cannot import."""
+    from helpers.format_config import DataFormat
+    from helpers.ulp import _ULP_PROXY_DTYPES, has_ulp_gate
+
+    assert LIST_OUTPUTS == {
+        f.name for f in DataFormat if has_ulp_gate(f) and f not in _ULP_PROXY_DTYPES
+    }
 
 
 _OK = [
