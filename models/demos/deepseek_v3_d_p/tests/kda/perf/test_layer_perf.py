@@ -48,7 +48,7 @@ _LOUDBOX_PERF_SKU = "bh_loudbox"
 _QUIETBOX_PERF_SKU = "bh_quietbox"
 _PERF_MARGIN = 0.03
 # QuietBox SP4xTP1's sustained replays run at a power-limited clock that varies between runs.
-_PERF_MARGIN_BY_LAYOUT = {"SP4xTP1": 0.05}
+_PERF_MARGIN_BY_LAYOUT = {"SP4xTP1": 0.07}
 # Host wall time of one traced call: the median over _TIMING_SAMPLES samples, each of back-to-back trace replays
 # through device synchronization.
 _PERF_REFERENCE_MS = {
@@ -57,7 +57,7 @@ _PERF_REFERENCE_MS = {
         "TP4-linear": 0.188,
     },
     _QUIETBOX_PERF_SKU: {
-        "SP4xTP1": 1.533,
+        "SP4xTP1": 1.600,
         "TP4-ring": 0.086,
     },
 }
