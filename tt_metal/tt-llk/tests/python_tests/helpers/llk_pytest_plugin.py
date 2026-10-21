@@ -1183,7 +1183,7 @@ def pytest_testnodedown(node, error):
     from . import ulp_sweep
 
     ulp_sweep.merge_measured(
-        getattr(node, "workeroutput", {}).get(ulp_sweep.WORKEROUTPUT_KEY, ())
+        getattr(node, "workeroutput", {}).get(ulp_sweep.WORKEROUTPUT_KEY)
     )
 
 

@@ -1,40 +1,36 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-side guards for ``helpers/ulp_domains.py``: what a ``domains`` list means, the
-rule that draws one from a cell's binade profile, and its one spelling.
+"""Host-side guards for ``helpers/ulp_domains.py``: what a ``domains`` list means, and
+the rule that draws one from a cell's binade profile.
 
-No device and no torch: the rule is pure, and a profile is a dict. The tensor side
+No device: the rule is pure, and a profile is a dict. The tensor side
 (``ulp_sweep.binade_maxima``, ``domain_figures``) is held in test_ulp_sweep.py.
 """
 
 import math
 
 import pytest
-import yaml
+from helpers.format_config import DataFormat
+from helpers.ulp import ULP_FORMATS
 from helpers.ulp_domains import (
     BINADE_OFFSET,
-    CEILINGS,
     DOMAIN_MIN_BIN_LANES,
     DOMAIN_MIN_LANES,
     Domain,
+    Problem,
     binade,
     binade_edges,
     check_domains,
     contract_of,
-    domains_text,
     entries_of,
-    number_text,
     partition,
+    usable_budget_ceiling,
 )
+from helpers.ulp_testing import refused
 
 INF = math.inf
-BF16 = CEILINGS["Float16_b"]
-
-
-def _refuses(match):
-    """The suite's ``expect_error`` fixture needs a device; these are host-only tests."""
-    return pytest.raises(ValueError, match=match)  # allow-pytest.raises: host-only test
+BF16 = usable_budget_ceiling(DataFormat.Float16_b)
 
 
 def _profile(worst_of, lanes=128):
@@ -84,9 +80,6 @@ def test_a_profile_splits_where_the_worst_lane_crosses_the_ceiling():
     """Approximate tanh: 10 steps below |x| = 1, 3 steps above; bf16's ceiling is 6."""
     spans = partition(_profile(lambda k, s: 10 if k < 0 else 3), BF16)
     assert spans == ((-INF, -1.0, True), (-1.0, 1.0, True), (1.0, INF, True))
-    entries = (Domain(-INF, -1, 3), Domain(-1, 1, 10), Domain(1, INF, 3))
-    assert contract_of(entries, BF16) == ("tolerance", 10)
-    assert contract_of(entries[:1] + (Domain(-1, INF, 5),), BF16) == ("ulp", 5)
 
 
 def test_a_step_class_flickering_between_binades_is_one_entry():
@@ -144,7 +137,8 @@ def test_the_profile_of_a_strided_float32_input_partitions_the_same_way():
     """~129 samples per binade rather than 128 values: the rule reads lanes, not
     values, so nothing about it is bf16-specific."""
     spans = partition(
-        _profile(lambda k, s: 500000 if k > 20 else 2, lanes=129), CEILINGS["Float32"]
+        _profile(lambda k, s: 500000 if k > 20 else 2, lanes=129),
+        usable_budget_ceiling(DataFormat.Float32),
     )
     assert spans == (
         (-INF, -(2.0**21), True),
@@ -211,90 +205,45 @@ _OK = [
 ]
 
 
-def test_a_well_formed_list_loads_as_its_entries():
-    assert check_domains("Tanh row 1", _OK) == (
-        Domain(-INF, -1, 3),
-        Domain(-1, 1, 10),
-        Domain(1, INF, 3),
-    )
-    assert check_domains(
-        "t", [{"low": -INF, "high": 0, "ulp": None}, {"low": 0, "high": INF, "ulp": 1}]
-    )
+def test_a_well_formed_list_is_accepted():
+    check_domains((Domain(-INF, -1, 3), Domain(-1, 1, 10), Domain(1, INF, 3)))
+    check_domains((Domain(-INF, 0), Domain(0, INF, 1)))
 
 
 @pytest.mark.parametrize(
-    "value, problem",
+    "domains, problem",
     [
-        ([], "non-empty list"),
-        ("[]", "non-empty list"),
-        ([{"low": -INF, "high": INF}], "exactly the keys"),
-        ([{"high": INF, "low": -INF, "ulp": 1}], "in that order"),
-        ([{"low": -INF, "high": INF, "ulp": 1, "note": "x"}], "exactly the keys"),
-        ([{"low": -INF, "high": INF, "ulp": True}], "integer >= 0 or null"),
-        ([{"low": -INF, "high": INF, "ulp": -1}], "integer >= 0 or null"),
-        ([{"low": -INF, "high": INF, "ulp": 1.5}], "integer >= 0 or null"),
-        ([{"low": 1, "high": 1, "ulp": 0}], "low < high"),
-        ([{"low": -1, "high": INF, "ulp": 0}], "cover \\(-inf, inf\\)"),
-        ([{"low": -INF, "high": 1, "ulp": 0}], "cover \\(-inf, inf\\)"),
-        (_OK[:1] + [{"low": 0, "high": INF, "ulp": 1}], "contiguous"),
-        (
-            [{"low": -INF, "high": 3, "ulp": 1}, {"low": 3, "high": INF, "ulp": 1}],
-            "0 or a power of two",
-        ),
-        ([{"low": -INF, "high": INF, "ulp": None}], "no entry carries a figure"),
+        ((), Problem.EMPTY_DOMAINS),
+        ((Domain(-1, INF, 0),), Problem.NOT_COVERING),
+        ((Domain(-INF, 1, 0),), Problem.NOT_COVERING),
+        ((Domain(-INF, -1, 3), Domain(0, INF, 1)), Problem.GAP),
+        ((Domain(-INF, 3, 1), Domain(3, INF, 1)), Problem.EDGE_NOT_POWER_OF_TWO),
+        ((Domain(-INF, INF),), Problem.NO_FIGURE),
     ],
-    ids=[
-        "empty",
-        "not-a-list",
-        "missing-key",
-        "keys-out-of-order",
-        "extra-key",
-        "ulp-bool",
-        "ulp-negative",
-        "ulp-float",
-        "low-not-below-high",
-        "no-minus-inf",
-        "no-plus-inf",
-        "gap",
-        "edge-not-a-power-of-two",
-        "all-null",
-    ],
+    ids=lambda v: v.name if isinstance(v, Problem) else "",
 )
-def test_a_malformed_list_says_what_is_wrong(value, problem):
-    with _refuses(problem):
-        check_domains("Tanh row 1", value)
+def test_a_malformed_list_is_refused(domains, problem):
+    with refused(problem):
+        check_domains(domains)
 
 
-def test_the_one_spelling_reads_back_as_the_same_numbers():
-    """``.inf`` as YAML reads it, integral values without a decimal point, anything
-    else as ``repr``: what the emitter writes, PyYAML loads back as the same floats."""
-    assert number_text(INF) == ".inf" and number_text(-INF) == "-.inf"
-    assert number_text(0.0) == "0" and number_text(65536.0) == "65536"
-    assert (
-        number_text(-1.0) == "-1"
-        and number_text(3) == "3"
-        and number_text(None) == "null"
-    )
-    assert number_text(2.0**-8) == "0.00390625"
-    assert number_text(2.0**126) == "8.507059173023462e+37"
-    text = domains_text(check_domains("t", _OK))
-    assert (
-        text
-        == "[{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10}, {low: 1, high: .inf, ulp: 3}]"
-    )
-    assert yaml.safe_load("domains: " + text)["domains"] == _OK
-    assert domains_text(_OK) == text  # the loaded mappings spell the same
+@pytest.mark.parametrize(
+    "low, high, ulp, problem",
+    [(1, 1, 0, Problem.EMPTY_RANGE), (-INF, INF, -1, Problem.BAD_NUMBER)],
+    ids=lambda v: v.name if isinstance(v, Problem) else "",
+)
+def test_a_malformed_entry_is_refused(low, high, ulp, problem):
+    with refused(problem):
+        Domain(low, high, ulp)
 
 
-def test_the_ceilings_are_the_registrys():
-    """The slim runner cannot import the registry, so the ceilings are spelled out here;
-    they must be ``usable_budget_ceiling``'s to the step, over exactly the formats the
-    SFPU computes in."""
-    from helpers.format_config import DataFormat
-    from helpers.sfpu_accuracy_budget import usable_budget_ceiling
-    from helpers.ulp import ULP_FORMATS
+def test_a_list_implies_its_whole_cell_contract():
+    """Gated at its largest figure when every figure is within the ceiling."""
+    entries = (Domain(-INF, -1, 3), Domain(-1, 1, 10), Domain(1, INF, 3))
+    assert contract_of(entries, BF16) == (False, 10)
+    assert contract_of(entries[:1] + (Domain(-1, INF, 5),), BF16) == (True, 5)
 
-    assert set(CEILINGS) == {f.name for f in ULP_FORMATS}
-    assert CEILINGS == {
-        name: usable_budget_ceiling(DataFormat[name]) for name in CEILINGS
-    }
+
+def test_the_ceilings_are_the_rtol_they_replace():
+    """``usable_budget_ceiling`` is the format's ``rtol`` in steps, rounded down."""
+    assert [usable_budget_ceiling(fmt) for fmt in ULP_FORMATS] == [6.0, 51.0, 419430.0]

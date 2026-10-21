@@ -77,8 +77,7 @@ from helpers.test_variant_parameters import (
     generate_input_dim,
 )
 from helpers.ulp import ulp_distance, ulp_stats
-from helpers.ulp_budget_diff import RECORDED_SKIP
-from helpers.ulp_domains import number_text, partition
+from helpers.ulp_domains import partition
 from helpers.ulp_sweep import (
     band_mask,
     binade_maxima,
@@ -301,7 +300,7 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
     distance = ulp_distance(golden, result, flush_subnormals=_FLUSH_SUBNORMALS)
     stats = ulp_stats(distance, mask)
     lanes = int(mask.sum())
-    key = (in_fmt.name, out_fmt.name, approx_mode.name, dest_acc.name)
+    key = ulp_sweep.cell_key(in_fmt, out_fmt, approx_mode, dest_acc)
 
     # Before the emit return, or an empty mask is recorded as bit-exact `max: 0`. The
     # overflow first: an all-non-finite cell also has `lanes == 0`, and only this
@@ -328,10 +327,12 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
                 nonfinite=int(overflowed.sum()),
             )
         if ulp_sweep.EMIT:
-            ulp_sweep.record_unmeasurable(mathop.name, key, verdict)
+            ulp_sweep.record_unmeasurable(mathop, key, verdict)
             return
         if not gated:
-            pytest.skip(f"{cell}: {RECORDED_SKIP} -- not measurable: {unmeasurable}")
+            pytest.skip(
+                f"{cell}: measured, not gated -- not measurable: {unmeasurable}"
+            )
         raise AssertionError(f"{cell}: {unmeasurable}")
 
     # Where each lane's input sits, as the kernel received it, for the domains; and the
@@ -357,11 +358,9 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
             distance,
             mask=mask,
             bins=bins,
-            domains=entry_readings(drawn, x, distance, mask, judged) if drawn else None,
+            readings=entry_readings(drawn, x, distance, mask, judged),
         )
-        ulp_sweep.record(
-            mathop.name, key, int(stats["max"]), floor=floor, domains=drawn
-        )
+        ulp_sweep.record(mathop, key, int(stats["max"]), floor=floor, domains=drawn)
         return
 
     if not domains:
@@ -375,7 +374,7 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
             # there is no record for the headroom report either, and a regression would
             # show green.
             pytest.skip(
-                f"{cell}: {RECORDED_SKIP} -- on the tolerance metric; measured max "
+                f"{cell}: measured, not gated -- on the tolerance metric; measured max "
                 f"{int(stats['max'])} ULP over {lanes} lanes. The headroom report "
                 "(ulp_budget_diff.py headroom over --ulp-measure) holds it to its row's "
                 "recorded figure."
@@ -410,11 +409,11 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
         distance,
         mask=mask,
         bins=binade_maxima(x, floored_distance(distance, covered), mask, present),
-        domains=readings,
+        readings=readings,
     )
     if not gated:
         pytest.skip(
-            f"{cell}: {RECORDED_SKIP} -- every entry is past the ceiling; measured max "
+            f"{cell}: measured, not gated -- every entry is past the ceiling; measured max "
             f"{int(stats['max'])} ULP over {lanes} lanes. The headroom report holds each "
             "entry to its figure."
         )
@@ -442,8 +441,8 @@ def test_unary_sfpu_ulp_sweep(mathop, in_fmt, out_fmt, approx_mode, dest_acc):
             flush_subnormals=_FLUSH_SUBNORMALS,
         ):
             failed.append(
-                f"x in [{number_text(entry.low)}, {number_text(entry.high)}): worst "
-                f"lane {reading[2]} over its figure {entry.ulp}"
+                f"x in [{entry.low:g}, {entry.high:g}): worst "
+                f"lane {reading.worst} over its figure {entry.ulp}"
             )
     leftover = judged & ~inside
     if (

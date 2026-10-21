@@ -1,69 +1,92 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Where an op holds its figure: the domains of a swept cell.
+"""Where an op holds its figure: the domains of a swept cell, and the typed errors the
+budget table is refused with.
 
-One line of ``sfpu_accuracy_budget.yaml`` says how an op behaves over the whole swept
-range of one format combination::
+A row of ``sfpu_accuracy_budget.yaml`` the sweep writes carries a list of
+:class:`Domain` entries. An entry holds the lanes whose input, as the kernel received
+it, satisfies ``low <= x < high``; ``ulp`` is the worst ranked lane there, in steps,
+outside the row's near-zero floor if it has one -- or ``None`` where too few lanes are
+ranked to draw an edge on (fewer than :data:`DOMAIN_MIN_BIN_LANES` in each of its
+binades): past the op's claim (``cos`` beyond 65504), undefined (``log`` below 0), or an
+answer the Dest cannot hold. The sweep holds the few ranked lanes a null entry has to
+the row's largest figure, so the emitter writes ``None`` only while they fit it
+(:func:`entries_of`). An entry whose figure is within the output format's
+:func:`usable_budget_ceiling` is gated at it by the sweep; one past the ceiling is
+measured and held to its figure by the headroom report. The whole-cell contract is
+derived (:func:`contract_of`).
 
-    - {in: Float16_b, out: Float16_b, approx: "Yes", dest: "No",
-       domains: [{low: -.inf, high: -1, ulp: 3}, {low: -1, high: 1, ulp: 10},
-                 {low: 1, high: .inf, ulp: 3}]}
-
-An entry ``{low: L, high: H, ulp: U}`` holds the lanes whose input, as the kernel
-received it, satisfies ``L <= x < H``. ``U`` is the worst ranked lane there, in steps,
-outside the row's near-zero floor if it has one -- the same quantity a plain row's
-``measured`` is, over fewer lanes -- or ``null`` where too few lanes are ranked to draw
-an edge on (fewer than :data:`DOMAIN_MIN_BIN_LANES` in each of its binades): past the
-op's claim (``cos`` beyond 65504), undefined (``log`` below 0), or an answer the Dest
-cannot hold. The sweep holds the few ranked lanes a null entry has to the row's largest
-figure, so the emitter writes ``null`` only while they fit it (:func:`entries_of`).
-An entry whose figure is within the output format's usable ceiling
-(:data:`CEILINGS`) is gated at it by the sweep; one past the ceiling is measured and
-held to its figure by the headroom report. The whole-cell contract a caller gets is
-derived: gated at the largest figure when every ranked entry is within the ceiling,
-tolerance otherwise. A row with a list carries no cell-level ``measured`` or
-``metric``: the list is the statement.
-
-The list is a contiguous partition of ``(-inf, inf)``: the first ``low`` is ``-.inf``,
-the last ``high`` is ``.inf``, each ``high`` is the next ``low``, and every interior edge
-is ``0`` or a power of two. The emitter draws it from the sweep's per-lane distances
-(:func:`partition`); nothing else writes it, and a one-domain op gets a one-entry list,
-so every per-element row has the same shape.
-
-Standalone on purpose -- the standard library only -- because the PR budget guard
-(``ulp_budget_diff.py``) runs on a slim runner and imports it by path, and the registry
-loader, the table renderer and the guard share one rule here so they cannot drift.
+The list is a contiguous partition of ``(-inf, inf)`` whose interior edges are ``0`` or
+powers of two (:func:`check_domains`). The emitter draws it from the sweep's per-lane
+distances (:func:`partition`); nothing else writes it.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from enum import Enum, auto
+from typing import Callable, Dict, List, Optional, Tuple
 
-#: The row field that holds the list.
-DOMAINS_FIELD = "domains"
+from .format_config import DataFormat
 
-#: What a row with a list may not carry: the list is the whole statement of what was
-#: measured and what gates, so a cell-level figure or metric beside it would be a second
-#: statement to drift from the first. The registry's loader and the PR guard both read
-#: it here.
-NOT_BESIDE_DOMAINS = ("measured", "metric", "atol", "rtol", "nonfinite")
 
-#: An entry's keys, in the order they are written.
-ENTRY_KEYS = ("low", "high", "ulp")
+class Problem(Enum):
+    """Why the budget table, a row of it or a ``domains`` list was refused. Tests assert
+    on these, never on a message."""
 
-#: ``sfpu_accuracy_budget.usable_budget_ceiling`` by format name: the largest figure
-#: that is still *tighter* than the tolerance it replaces. Its keys are the formats a
-#: row may name (``ulp.ULP_FORMATS``), in and out: the SFPU computes in 16- and 32-bit
-#: floats, and a block float's error is the unpacker's and packer's, not the op's.
-#: Spelled out because this module may not import the registry; a host test ties them.
-CEILINGS: Dict[str, float] = {
-    "Float16_b": 6.0,
-    "Float16": 51.0,
-    "Float32": 419430.0,
-}
+    UNKNOWN_OP = auto()
+    UNKNOWN_FIELD = auto()
+    NOT_A_MEMBER = auto()
+    BAD_NUMBER = auto()
+    WRONG_SHAPE = auto()
+    NO_ROWS = auto()
+    DUPLICATE_YAML_KEY = auto()
+    REPEATED_KEY = auto()
+    AMBIGUOUS = auto()
+    NOT_A_COMPUTE_FORMAT = auto()
+    MISSING_FIGURE = auto()
+    MIXED_METRIC = auto()
+    NONFINITE_ON_BUDGET = auto()
+    BESIDE_DOMAINS = auto()
+    UNPINNED_DOMAINS = auto()
+    EMPTY_DOMAINS = auto()
+    EMPTY_RANGE = auto()
+    NOT_COVERING = auto()
+    GAP = auto()
+    EDGE_NOT_POWER_OF_TWO = auto()
+    NO_FIGURE = auto()
+
+
+class TableError(ValueError):
+    """The table, or something built for it, is refused: :attr:`problem` says why, and
+    the message names where, for the person fixing it."""
+
+    def __init__(self, problem: Problem, where: object = ""):
+        self.problem = problem
+        super().__init__(f"{problem.name}: {where}" if where != "" else problem.name)
+
+
+def usable_budget_ceiling(output_format: DataFormat) -> float:
+    """The largest budget that is still *stronger* than the gate it replaces.
+
+    ``MAX_MEANINGFUL_ULP`` is the wrong bound: ``2**mantissa_bits`` is roughly 100%
+    relative error, so it admits budgets that gate nothing -- and since ``passed_test``
+    returns on the ULP verdict and skips both ``isclose`` and PCC, such a budget *is* the
+    whole gate. The real bound is the ``rtol`` half of the ``isclose`` this replaces,
+    itself a step budget at large magnitude, rounded *down* to a whole step: 419,430
+    steps for fp32, 51 for fp16, 6 for bf16. Down, not up: bf16's 6.4 lets ``isclose``
+    accept ``128 -> 134`` and refuse ``128 -> 135``, so a 7-step budget would pass what
+    the tolerance it displaced rejected, with no PCC behind it.
+    """
+    from .ulp import MANTISSA_BITS_FOR_ULP, MAX_MEANINGFUL_ULP, ulp_dtype
+    from .utils import tolerances
+
+    dtype = ulp_dtype(output_format)
+    by_rtol = tolerances[output_format].rtol * (1 << MANTISSA_BITS_FOR_ULP[dtype])
+    return float(math.floor(min(by_rtol, float(MAX_MEANINGFUL_ULP[dtype]))))
+
 
 #: How finely the gateable range is split. ``None`` is the binary rule: a binade is
 #: either within the ceiling or past it, and adjacent binades on the same side merge.
@@ -94,14 +117,6 @@ BINADE_OFFSET = 151
 _INF = float("inf")
 
 
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 @dataclass(frozen=True)
 class Domain:
     """One entry: the lanes with ``low <= x < high``, and the worst of them in steps,
@@ -109,26 +124,17 @@ class Domain:
 
     low: float
     high: float
-    ulp: Optional[int]
+    ulp: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if not (_is_number(self.low) and _is_number(self.high)):
-            raise ValueError(f"a domain's edges must be numbers, got {self!r}")
         if not self.low < self.high:
-            raise ValueError(f"a domain needs low < high, got {self!r}")
-        if self.ulp is not None and not (_is_int(self.ulp) and self.ulp >= 0):
-            raise ValueError(
-                f"a domain's ulp must be an integer >= 0 or null, got {self!r}"
-            )
-        object.__setattr__(self, "low", float(self.low))
-        object.__setattr__(self, "high", float(self.high))
+            raise TableError(Problem.EMPTY_RANGE, self)
+        if self.ulp is not None and self.ulp < 0:
+            raise TableError(Problem.BAD_NUMBER, self)
 
     def gated(self, ceiling: float) -> bool:
         """Whether the sweep holds this entry's lanes to its figure."""
         return self.ulp is not None and self.ulp <= ceiling
-
-    def as_entry(self) -> Dict[str, Any]:
-        return {"low": self.low, "high": self.high, "ulp": self.ulp}
 
 
 def binade(x: float) -> int:
@@ -332,85 +338,24 @@ def _is_power_of_two(value: float) -> bool:
     return value != 0 and math.isfinite(value) and math.frexp(abs(value))[0] == 0.5
 
 
-def check_domains(where: str, value: Any) -> Tuple[Domain, ...]:
-    """*value*, a row's ``domains`` as PyYAML loaded it, as :class:`Domain` entries --
-    or a ``ValueError`` naming what is wrong. The registry's loader and the PR guard
-    both call this, so the guard cannot pass a table the registry refuses to load."""
-    if not isinstance(value, list) or not value:
-        raise ValueError(
-            f"{where}: `{DOMAINS_FIELD}` must be a non-empty list of entries"
-        )
-    domains: List[Domain] = []
-    for i, entry in enumerate(value):
-        name = f"{where}: `{DOMAINS_FIELD}` entry {i + 1}"
-        if not isinstance(entry, dict) or tuple(entry) != ENTRY_KEYS:
-            raise ValueError(
-                f"{name} must be a mapping with exactly the keys "
-                f"{', '.join(ENTRY_KEYS)}, in that order; got {entry!r}"
-            )
-        try:
-            domains.append(Domain(entry["low"], entry["high"], entry["ulp"]))
-        except ValueError as bad:
-            raise ValueError(f"{name}: {bad}") from None
+def check_domains(domains: Tuple[Domain, ...]) -> None:
+    """Refuse a list that is not a contiguous partition of ``(-inf, inf)`` with interior
+    edges at 0 or a power of two, or that holds no figure at all."""
+    if not domains:
+        raise TableError(Problem.EMPTY_DOMAINS)
     if domains[0].low != -_INF or domains[-1].high != _INF:
-        raise ValueError(
-            f"{where}: the list must cover (-inf, inf): the first `low` is -.inf and "
-            "the last `high` is .inf"
-        )
+        raise TableError(Problem.NOT_COVERING, domains)
     for before, after in zip(domains, domains[1:]):
         if before.high != after.low:
-            raise ValueError(
-                f"{where}: the list must be contiguous; an entry ends at "
-                f"{number_text(before.high)} and the next starts at "
-                f"{number_text(after.low)}"
-            )
+            raise TableError(Problem.GAP, (before, after))
         if before.high != 0 and not _is_power_of_two(before.high):
-            raise ValueError(
-                f"{where}: an interior edge is 0 or a power of two, got "
-                f"{number_text(before.high)}"
-            )
+            raise TableError(Problem.EDGE_NOT_POWER_OF_TWO, before)
     if all(d.ulp is None for d in domains):
-        raise ValueError(
-            f"{where}: no entry carries a figure; nothing to hold the cell to"
-        )
-    return tuple(domains)
+        raise TableError(Problem.NO_FIGURE, domains)
 
 
-def contract_of(
-    domains: Tuple[Domain, ...], ceiling: float
-) -> Tuple[str, Optional[int]]:
-    """The whole-cell contract a list implies: ``("ulp", figure)`` -- gated at the largest
-    figure -- when every ranked entry is within *ceiling*, else ``("tolerance",
-    figure)``. What a caller that does not look at domains is handed. A list with no
-    figure at all (which the loader refuses) reads as tolerance with none."""
-    figures = [d.ulp for d in domains if d.ulp is not None]
-    figure = max(figures) if figures else None
-    return ("ulp" if figure is not None and figure <= ceiling else "tolerance"), figure
-
-
-def number_text(value: Any) -> str:
-    """The one spelling of an edge or a figure: ``.inf``/``-.inf`` as YAML reads them,
-    an integral value without a decimal point, anything else as ``repr``, which is the
-    shortest text that reads back as the same float."""
-    if value is None:
-        return "null"
-    if value == _INF:
-        return ".inf"
-    if value == -_INF:
-        return "-.inf"
-    if _is_int(value):
-        return str(value)
-    if float(value).is_integer() and abs(value) < 2**53:
-        return str(int(value))
-    return repr(float(value))
-
-
-def entry_text(entry: Dict[str, Any]) -> str:
-    return "{" + ", ".join(f"{k}: {number_text(entry[k])}" for k in ENTRY_KEYS) + "}"
-
-
-def domains_text(value: Any) -> str:
-    """A ``domains`` value -- :class:`Domain` entries or the mappings PyYAML loads -- as
-    it is written on the row."""
-    entries = [d.as_entry() if isinstance(d, Domain) else d for d in value]
-    return "[" + ", ".join(entry_text(e) for e in entries) + "]"
+def contract_of(domains: Tuple[Domain, ...], ceiling: float) -> Tuple[bool, int]:
+    """``(gated, figure)``: the whole-cell contract a checked list implies -- gated at
+    its largest figure when every figure is within *ceiling*, tolerance otherwise."""
+    figure = max(d.ulp for d in domains if d.ulp is not None)
+    return figure <= ceiling, figure
