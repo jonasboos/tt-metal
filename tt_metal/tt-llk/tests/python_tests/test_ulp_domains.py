@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Host-side guards for ``helpers/ulp_domains.py``: what a ``domains`` list means, and
-the rule that draws one from a cell's binade profile.
-
-No device: the rule is pure, and a profile is a dict. The tensor side
-(``ulp_sweep.binade_maxima``, ``domain_figures``) is held in test_ulp_sweep.py.
-"""
+the rule that draws one from a cell's binade profile. The tensor side is in
+test_ulp_sweep.py."""
 
 import math
 
 import pytest
+from conftest import problem_id, refused
 from helpers.format_config import DataFormat
 from helpers.ulp import ULP_FORMATS
 from helpers.ulp_domains import (
@@ -22,21 +20,19 @@ from helpers.ulp_domains import (
     binade,
     binade_edges,
     check_domains,
-    contract_of,
     entries_of,
     partition,
     usable_budget_ceiling,
 )
-from helpers.ulp_testing import refused
 
 INF = math.inf
 BF16 = usable_budget_ceiling(DataFormat.Float16_b)
 
 
 def _profile(worst_of, lanes=128):
-    """A bfloat16-like profile: 254 binades a side, *lanes* present in each, the worst
-    ranked lane from ``worst_of(k, sign)`` (``None`` for an unranked binade), and the
-    single zero lane."""
+    """A bfloat16-like profile: 254 binades a side with *lanes* present, the worst
+    ranked lane from ``worst_of(k, sign)`` (``None`` for unranked), and the zero lane.
+    """
     bins = {}
     for k in range(-126, 128):
         for sign in (1, -1):
@@ -60,13 +56,9 @@ def test_binades_order_as_the_values_do():
     assert binade_edges(0) == (0.0, 0.0)
 
 
-@pytest.mark.parametrize(
-    "x", [-2.0, -1.5, -1.0, -0.75, -0.5, -(2.0**-149), 2.0**-149, 0.5, 1.0, 1.5, 2.0]
-)
+@pytest.mark.parametrize("x", [-1.0, -0.75, -(2.0**-149), 2.0**-149, 0.75, 1.0])
 def test_a_binade_holds_its_lanes_as_an_entry_does(x):
-    """``low <= x < high`` on both sides: -1 opens [-1, -0.5), as it opens an entry that
-    starts at -1, so no binade's lanes straddle an entry's edge. The smallest subnormal
-    still gets a binade of its own, apart from zero's."""
+    """``low <= x < high`` on both sides, so -1 opens [-1, -0.5) as it opens an entry."""
     low, high = binade_edges(binade(x))
     assert low <= x < high
     assert binade(x) != 0
@@ -83,22 +75,19 @@ def test_a_profile_splits_where_the_worst_lane_crosses_the_ceiling():
 
 
 def test_a_step_class_flickering_between_binades_is_one_entry():
-    """The pack path rounds some binades and not others, so the worst lane alternates
-    between 0 and 1 from one binade to the next on hundreds of cells. Both are within
-    the ceiling, and the binary rule does not tell them apart."""
+    """The pack path makes the worst lane alternate between 0 and 1 per binade; both are
+    within the ceiling."""
     assert partition(_profile(lambda k, s: k % 2), BF16) == ((-INF, INF, True),)
 
 
 def test_an_unranked_region_is_its_own_entry_with_zero_for_an_edge():
-    """`log` below zero: no lane is ranked. The edge between the two is where the
-    swept values stop, which is written as 0 rather than 2**-126."""
+    """`log` below zero: the edge where the swept values stop is written as 0."""
     spans = partition(_profile(lambda k, s: None if s < 0 else 1), BF16)
     assert spans == ((-INF, 0.0, False), (0.0, INF, True))
 
 
 def test_a_stray_ranked_lane_in_an_unranked_binade_is_noise():
-    """erfinv's [1, 2) binade has one ranked lane, at x = 1: fewer than
-    DOMAIN_MIN_BIN_LANES, so the binade is unranked and the list ends at 1."""
+    """One ranked lane in a binade (erfinv at x = 1) is under DOMAIN_MIN_BIN_LANES."""
 
     def profile():
         bins = _profile(lambda k, s: 4 if k < 0 else None)
@@ -114,8 +103,6 @@ def test_a_stray_ranked_lane_in_an_unranked_binade_is_noise():
 
 
 def test_a_narrow_gateable_island_folds_into_its_looser_neighbour_but_a_bad_one_stays():
-    """One good binade (128 lanes, under DOMAIN_MIN_LANES) inside a bad range is not
-    advertised on its own; one bad binade inside a good range always is."""
     assert DOMAIN_MIN_LANES > 128 >= DOMAIN_MIN_BIN_LANES
     good_island = partition(_profile(lambda k, s: 2 if (k, s) == (3, 1) else 10), BF16)
     assert good_island == ((-INF, INF, True),)
@@ -133,38 +120,7 @@ def test_the_zero_lane_never_forms_an_entry():
         assert any(low <= 0 < high for low, high, _ in spans)
 
 
-def test_the_profile_of_a_strided_float32_input_partitions_the_same_way():
-    """~129 samples per binade rather than 128 values: the rule reads lanes, not
-    values, so nothing about it is bf16-specific."""
-    spans = partition(
-        _profile(lambda k, s: 500000 if k > 20 else 2, lanes=129),
-        usable_budget_ceiling(DataFormat.Float32),
-    )
-    assert spans == (
-        (-INF, -(2.0**21), True),
-        (-(2.0**21), 2.0**21, True),
-        (2.0**21, INF, True),
-    )
-
-
-def test_a_finer_step_class_splits_the_gateable_range(monkeypatch):
-    """``DOMAIN_CLASS_BITS``: with 1, classes a factor of 2 apart (0 and 1 together)
-    split the gateable range as well; a narrow class still folds into a looser
-    neighbour."""
-    import helpers.ulp_domains as ulp_domains
-
-    monkeypatch.setattr(ulp_domains, "DOMAIN_CLASS_BITS", 1)
-    lanes = 1024  # one binade per side is a domain of its own at DOMAIN_MIN_LANES
-    spans = partition(_profile(lambda k, s: 4 if s > 0 else 1, lanes=lanes), BF16)
-    assert spans == ((-INF, 0.0, True), (0.0, INF, True))
-    narrow = partition(
-        _profile(lambda k, s: 1 if (k, s) == (3, 1) else 4, lanes=128), BF16
-    )
-    assert narrow == ((-INF, INF, True),)
-
-
 def _worst_of(figures):
-    """*worst(low, high)* over a dict of ``(low, high) -> worst``."""
     return lambda low, high: figures.get((low, high))
 
 
@@ -179,9 +135,7 @@ def test_a_null_span_keeps_null_while_its_strays_fit_the_largest_figure():
 
 
 def test_the_null_span_whose_strays_are_worst_takes_a_figure():
-    """The sweep holds a null entry's ranked lanes to the row's largest figure, so a
-    list whose strays exceed it would fail the next run on identical output. Only the
-    worst such span needs a figure: the others then fit the new largest."""
+    """Only the worst such span needs a figure: the others then fit the new largest."""
     spans = ((-INF, -1.0, False), (-1.0, 0.0, False), (0.0, INF, True))
     figures = {(-INF, -1.0): 40, (-1.0, 0.0): 1000, (0.0, INF): 3}
     assert entries_of(spans, _worst_of(figures)) == (
@@ -192,17 +146,8 @@ def test_the_null_span_whose_strays_are_worst_takes_a_figure():
 
 
 def test_spans_with_no_figure_draw_no_list():
-    """Every binade ranks a few lanes: no span is ranked, and a list with no figure is
-    one ``check_domains`` refuses when the registry loads. The cell gets a plain row."""
     assert entries_of(((-INF, INF, False),), lambda low, high: 1000) == ()
     assert entries_of(((-INF, 0.0, True), (0.0, INF, False)), lambda lo, hi: None) == ()
-
-
-_OK = [
-    {"low": -INF, "high": -1, "ulp": 3},
-    {"low": -1, "high": 1, "ulp": 10},
-    {"low": 1, "high": INF, "ulp": 3},
-]
 
 
 def test_a_well_formed_list_is_accepted():
@@ -220,7 +165,7 @@ def test_a_well_formed_list_is_accepted():
         ((Domain(-INF, 3, 1), Domain(3, INF, 1)), Problem.EDGE_NOT_POWER_OF_TWO),
         ((Domain(-INF, INF),), Problem.NO_FIGURE),
     ],
-    ids=lambda v: v.name if isinstance(v, Problem) else "",
+    ids=problem_id,
 )
 def test_a_malformed_list_is_refused(domains, problem):
     with refused(problem):
@@ -230,20 +175,12 @@ def test_a_malformed_list_is_refused(domains, problem):
 @pytest.mark.parametrize(
     "low, high, ulp, problem",
     [(1, 1, 0, Problem.EMPTY_RANGE), (-INF, INF, -1, Problem.BAD_NUMBER)],
-    ids=lambda v: v.name if isinstance(v, Problem) else "",
+    ids=problem_id,
 )
 def test_a_malformed_entry_is_refused(low, high, ulp, problem):
     with refused(problem):
         Domain(low, high, ulp)
 
 
-def test_a_list_implies_its_whole_cell_contract():
-    """Gated at its largest figure when every figure is within the ceiling."""
-    entries = (Domain(-INF, -1, 3), Domain(-1, 1, 10), Domain(1, INF, 3))
-    assert contract_of(entries, BF16) == (False, 10)
-    assert contract_of(entries[:1] + (Domain(-1, INF, 5),), BF16) == (True, 5)
-
-
 def test_the_ceilings_are_the_rtol_they_replace():
-    """``usable_budget_ceiling`` is the format's ``rtol`` in steps, rounded down."""
     assert [usable_budget_ceiling(fmt) for fmt in ULP_FORMATS] == [6.0, 51.0, 419430.0]

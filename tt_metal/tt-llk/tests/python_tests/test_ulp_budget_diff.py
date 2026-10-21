@@ -9,10 +9,10 @@ import math
 
 import pytest
 import yaml
+from conftest import refused
 from helpers.chip_architecture import ChipArchitecture
 from helpers.format_config import DataFormat
 from helpers.llk_params import ApproximationMode, DestAccumulation, MathOperation
-from helpers.sfpu_accuracy_budget import MEASURED_ARCH
 from helpers.ulp_budget_diff import (
     _KIND_TEXT,
     _MAX_ROWS,
@@ -33,6 +33,7 @@ from helpers.ulp_domains import (
     binade,
 )
 from helpers.ulp_table import (
+    MEASURED_ARCH,
     BudgetKey,
     Measurement,
     Metric,
@@ -40,7 +41,6 @@ from helpers.ulp_table import (
     Row,
     write_table_file,
 )
-from helpers.ulp_testing import refused
 
 INF = math.inf
 F16B, F16, F32 = DataFormat.Float16_b, DataFormat.Float16, DataFormat.Float32

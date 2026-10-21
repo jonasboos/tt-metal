@@ -1265,7 +1265,7 @@ def finish_emit(arch, testsfailed: int, path=None, exitstatus=0) -> "WriteReport
     an :class:`EmitRefused` subclass naming why nothing was written. *exitstatus* is
     pytest's; *testsfailed* is read first to give a failed run its own message."""
     import pytest
-    from helpers.sfpu_accuracy_budget import MEASURED_ARCH
+    from helpers.ulp_table import MEASURED_ARCH
 
     if arch != MEASURED_ARCH:
         raise WrongArch(arch)

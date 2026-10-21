@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .llk_params import MathOperation
-from .sfpu_accuracy_budget import MEASURED_ARCH, _winner, steps_bind
 from .ulp import ULP_FORMATS
 from .ulp_domains import (
     DOMAIN_MIN_BIN_LANES,
@@ -38,13 +37,16 @@ from .ulp_domains import (
     usable_budget_ceiling,
 )
 from .ulp_table import (
+    MEASURED_ARCH,
     BudgetKey,
     Measurement,
     Metric,
     Row,
     Table,
     load_table,
+    most_specific,
     read_measurements,
+    steps_bind,
 )
 
 #: A cell identity: the op and the key of the row that decides it.
@@ -71,7 +73,9 @@ def _resolve(
 ) -> Optional[Row]:
     """The row of *op* the registry would resolve *query* to, among those *only*
     admits."""
-    found = _winner({row.key: row for row in table.get(op, ()) if only(row)}, query)
+    found = most_specific(
+        {row.key: row for row in table.get(op, ()) if only(row)}, query
+    )
     return None if found is None else found[1]
 
 
