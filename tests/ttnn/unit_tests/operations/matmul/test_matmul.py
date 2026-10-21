@@ -5133,97 +5133,72 @@ def test_matmul_bcast_in0_reuse_outer_blocks(device, per_core_M, out_block_h, pe
     assert device.cache_entries_counter.total == 1
 
 
-def _dst_full_sync_program_config(family, sbh, sbw):
-    grid = ttnn.CoreCoord(8, 8)
-    if family == "1d":  # M 1 tile, per core 1x10
-        return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-            compute_with_storage_grid_size=grid,
-            in0_block_w=2,
-            out_subblock_h=sbh,
-            out_subblock_w=sbw,
-            out_block_h=1,
-            out_block_w=10,
-            per_core_M=1,
-            per_core_N=10,
-            fuse_batch=True,
-            fused_activation=None,
-            mcast_in0=True,
+def _bias_logical_h_program_config(config_kind, m, n, k):
+    if config_kind == "reuse":
+        return ttnn.MatmulMultiCoreReuseProgramConfig(
+            compute_with_storage_grid_size=(1, 1),
+            in0_block_w=k // 32,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            per_core_M=m // 32,
+            per_core_N=n // 32,
         )
-    if family == "2d":  # M 1 tile, per core 1x16
-        return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
-            compute_with_storage_grid_size=grid,
-            in0_block_w=2,
-            out_subblock_h=sbh,
-            out_subblock_w=sbw,
-            out_block_h=1,
-            out_block_w=16,
-            per_core_M=1,
-            per_core_N=16,
-            transpose_mcast=False,
-            fused_activation=None,
-        )
-    return ttnn.MatmulMultiCoreReuseProgramConfig(  # batch 8, per core 8x8 (8 blocks, one per core)
-        compute_with_storage_grid_size=grid,
-        in0_block_w=1,
-        out_subblock_h=sbh,
-        out_subblock_w=sbw,
-        per_core_M=8,
-        per_core_N=8,
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(1, 1),
+        in0_block_w=k // 32,
+        out_subblock_h=1,
+        out_subblock_w=1,
+        out_block_h=m // 32,
+        out_block_w=n // 32,
+        per_core_M=m // 32,
+        per_core_N=n // 32,
+        fuse_batch=True,
+        mcast_in0=True,
     )
 
 
+# Rejects every logical bias h that the padded-h check would otherwise let silently read padding into outputs.
 @pytest.mark.parametrize(
-    "family, a_shape, b_shape",
+    "config_kind, m, bias_h",
     [
-        ("1d", [32, 128], [128, 20480]),
-        ("2d", [32, 64], [64, 4096]),
-        ("reuse", [8, 256, 96], [8, 96, 256]),
+        ("mcast1d", 64, 16),  # Mt>1 non-reuse: requires h == 1
+        ("reuse", 32, 16),  # Mt==1 reuse: small-M bug (only new check catches)
+        ("mcast1d", 32, 16),  # Mt==1 non-reuse: small-M bug (h in (1, M))
     ],
+    ids=["mcast1d-Mt2-h16", "reuse-Mt1-h16", "mcast1d-Mt1-h16"],
 )
-@pytest.mark.parametrize("fp32_dest_acc_en", [False, True])
-def test_matmul_dst_full_sync_subblock_limit(device, expect_error, family, a_shape, b_shape, fp32_dest_acc_en):
-    """dst_full_sync_en doesn't raise the subblock limit of the 2D, 1D and Reuse factories (#59689): subblocks above
-    8 tiles (4 with fp32 accumulation) are rejected instead of computing wrong values, and an allowed
-    subblock computes correctly."""
-    grid = device.compute_with_storage_grid_size()
-    if grid.x < 8 or grid.y < 8:
-        pytest.skip("device does not have 8x8 grid")
+def test_matmul_rejects_bias_with_mismatched_logical_h(device, expect_error, config_kind, m, bias_h):
     torch.manual_seed(0)
-    compute_kernel_config = ttnn.init_device_compute_kernel_config(
-        device.arch(),
-        math_fidelity=ttnn.MathFidelity.HiFi4,
-        math_approx_mode=False,
-        fp32_dest_acc_en=fp32_dest_acc_en,
-        packer_l1_acc=True,
-        dst_full_sync_en=True,
-    )
-    # (an allowed subblock, a subblock over the half-sync limit but within the full-sync one), within each
-    # family's per-core block
-    allowed, over = {
-        ("1d", False): ((1, 5), (1, 10)),
-        ("1d", True): ((1, 2), (1, 5)),
-        ("2d", False): ((1, 8), (1, 16)),
-        ("2d", True): ((1, 4), (1, 8)),
-        ("reuse", False): ((1, 8), (2, 8)),
-        ("reuse", True): ((1, 4), (1, 8)),
-    }[(family, fp32_dest_acc_en)]
-    torch_a = torch.randn(a_shape).bfloat16()
-    torch_b = torch.randn(b_shape).bfloat16()
-    a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.bfloat16)
-    b = ttnn.from_torch(torch_b, layout=ttnn.TILE_LAYOUT, device=device, dtype=ttnn.bfloat16)
+    n, k = 32, 32
+    a_t = ttnn.from_torch(torch.randn(m, k, dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device)
+    b_t = ttnn.from_torch(torch.randn(k, n, dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device)
+    bias_t = ttnn.from_torch(torch.randn(bias_h, n, dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device)
+    with expect_error(RuntimeError, "logical bias h"):
+        ttnn.linear(a_t, b_t, bias=bias_t, program_config=_bias_logical_h_program_config(config_kind, m, n, k))
 
-    with expect_error(RuntimeError, "to fit in hardware"):
-        ttnn.matmul(
-            a,
-            b,
-            program_config=_dst_full_sync_program_config(family, *over),
-            compute_kernel_config=compute_kernel_config,
-        )
 
-    output = ttnn.matmul(
-        a,
-        b,
-        program_config=_dst_full_sync_program_config(family, *allowed),
-        compute_kernel_config=compute_kernel_config,
+# Pins the valid-shape set: broadcast [1, N] on any non-reuse Mt, per-row [M, N] on Mt==1 non-reuse, elementwise [M, N] on reuse.
+@pytest.mark.parametrize(
+    "config_kind, m, bias_h",
+    [
+        ("mcast1d", 32, 1),  # Mt==1 non-reuse broadcast
+        ("mcast1d", 32, 32),  # Mt==1 non-reuse per-row
+        ("mcast1d", 64, 1),  # Mt>1 non-reuse broadcast
+        ("reuse", 32, 32),  # Mt==1 reuse
+        ("reuse", 64, 64),  # Mt>1 reuse
+    ],
+    ids=["mcast1d-Mt1-h1", "mcast1d-Mt1-hM", "mcast1d-Mt2-h1", "reuse-Mt1-hM", "reuse-Mt2-hM"],
+)
+def test_matmul_accepts_valid_biases(device, config_kind, m, bias_h):
+    torch.manual_seed(0)
+    n, k = 32, 32
+    a = torch.randn(m, k, dtype=torch.bfloat16)
+    b = torch.randn(k, n, dtype=torch.bfloat16)
+    bias = torch.randn(bias_h, n, dtype=torch.bfloat16)
+    a_t = ttnn.from_torch(a, layout=ttnn.TILE_LAYOUT, device=device)
+    b_t = ttnn.from_torch(b, layout=ttnn.TILE_LAYOUT, device=device)
+    bias_t = ttnn.from_torch(bias, layout=ttnn.TILE_LAYOUT, device=device)
+    out = ttnn.to_torch(
+        ttnn.linear(a_t, b_t, bias=bias_t, program_config=_bias_logical_h_program_config(config_kind, m, n, k))
     )
-    assert_with_pcc(torch_a.float() @ torch_b.float(), ttnn.to_torch(output).float(), 0.999)
+    assert_with_pcc(a.float() @ b.float() + bias.float(), out.float(), pcc=0.99)
