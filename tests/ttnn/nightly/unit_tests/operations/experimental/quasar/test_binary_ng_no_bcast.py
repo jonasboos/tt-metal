@@ -28,16 +28,18 @@ add/sub/mul/div — fp32 add/sub now route the ported SFPU primitives, see _run)
         pytest tests/ttnn/nightly/unit_tests/operations/experimental/quasar/test_binary_ng_no_bcast.py
 """
 
-import pytest
+import math
 
+import pytest
+import torch
 import ttnn
+
 from tests.ttnn.nightly.unit_tests.operations.experimental.quasar.binary_ng_quasar_test_utils import (
+    _block_sharded_config,
+    _height_sharded_config,
     _on_quasar,
     _run,
     _run_mixed,
-    _act,
-    _height_sharded_config,
-    _block_sharded_config,
     _width_sharded_config,
 )
 
@@ -272,6 +274,43 @@ def test_no_bcast_sfpu_divide(device, dtype_tt, layout):
         mem_config = _height_sharded_config(_HEIGHT_SHARD, _HEIGHT_GRID)
         shape = _HEIGHT_SHAPE
     _run(device, "divide", mem_config, dtype_tt, shape, pcc=0.99)
+
+
+# IEEE special-value (a, b) pairs; ±0 / ±0, ±inf / ±inf and NaN / 0 must give NaN.
+_DIVIDE_SPECIAL_PAIRS = [
+    (0.0, -0.0),
+    (-0.0, 0.0),
+    (-0.0, -0.0),
+    (math.inf, math.inf),
+    (-math.inf, -math.inf),
+    (math.nan, 0.0),
+    (0.0, 0.0),
+    (1.5, 0.0),
+    (-1.5, 0.0),
+    (1.5, -0.0),
+    (1.5, math.inf),
+    (-1.5, -math.inf),
+    (2.5, 2.5),
+]
+
+
+@pytest.mark.skipif(not _on_quasar(), reason="checks the Quasar SFPU divide")
+@pytest.mark.parametrize("dtype_tt", [ttnn.bfloat16, ttnn.float32])
+def test_no_bcast_divide_special_values(device, dtype_tt):
+    a = torch.ones(32, 32)
+    b = torch.ones(32, 32)
+    a[0, : len(_DIVIDE_SPECIAL_PAIRS)] = torch.tensor([pair[0] for pair in _DIVIDE_SPECIAL_PAIRS])
+    b[0, : len(_DIVIDE_SPECIAL_PAIRS)] = torch.tensor([pair[1] for pair in _DIVIDE_SPECIAL_PAIRS])
+    golden = torch.divide(a, b)
+
+    cfg = dict(dtype=dtype_tt, device=device, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    out = ttnn.experimental.quasar.divide(ttnn.from_torch(a, **cfg), ttnn.from_torch(b, **cfg))
+    out = ttnn.to_torch(out).float()
+
+    nan = torch.isnan(golden)
+    assert torch.equal(torch.isnan(out), nan), f"NaN lanes differ: {out[0, :16]} vs {golden[0, :16]}"
+    # Zero results come out +0; == treats -0 and +0 as equal.
+    assert torch.equal(out[~nan], golden[~nan]), f"{out[0, :16]} vs {golden[0, :16]}"
 
 
 # (a_mem, b_mem, out_mem) permutations beyond the uniform III / SSS already covered by
