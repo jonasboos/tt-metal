@@ -475,13 +475,34 @@ detail::ProgramImpl::~ProgramImpl() noexcept {
 DeviceAddr detail::ProgramImpl::reserve_program_local_l1(const IDevice* device, const CoreRangeSet& cores) {
     auto& arena = device->allocator_impl()->persistent_l1();
     auto& sealed_cores = persistent_l1_seals_[&arena];
+    const std::weak_ptr<PersistentL1Arena::Relocatable> holder = weak_from_this();
     for (const CoreCoord& core : corerange_to_cores(cores)) {
         if (sealed_cores.contains(core)) {
             continue;
         }
-        sealed_cores.emplace(core, arena.seal(CoreRangeSet(CoreRange(core))));
+        sealed_cores.emplace(core, arena.seal(CoreRangeSet(CoreRange(core)), holder));
     }
     return arena.high_water_mark(cores);
+}
+
+void detail::ProgramImpl::relocate_persistent_l1(PersistentL1Arena& arena) noexcept {
+    persistent_l1_seals_.erase(&arena);
+    // Locally allocated CBs, DFBs and scratchpads all stack on the arena's high-water mark, so
+    // all three are laid out again; globally allocated CBs keep their buffer's address. Setting
+    // compile_and_allocate_needed_ (both invalidations do) sends the next enqueue through the full
+    // allocate + validate path. A CB or DFB placed at a new address bumps its config generation,
+    // which refreshes the cached dispatch commands in place. allocate_scratchpads writes each new
+    // address through the kernel's CRTA view, which points into the first cached command stream
+    // once one exists; other cached streams copy from there on every enqueue.
+    invalidate_circular_buffer_allocation();
+    invalidate_dataflow_buffer_allocation();
+    for (auto& kernels_of_core_type : kernels_) {
+        for (auto& [kernel_handle, kernel] : kernels_of_core_type) {
+            for (auto& handle : kernel->scratchpad_binding_handles()) {
+                handle.allocated_address = 0;
+            }
+        }
+    }
 }
 
 Program::Program() : internal_(std::make_shared<detail::ProgramImpl>()) {
